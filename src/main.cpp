@@ -1,3 +1,25 @@
+// =============================================================================
+// Tiny-vLLM main.cpp — 推理引擎主入口
+// -----------------------------------------------------------------------------
+// 职责：
+//   1) 加载 Llama 3.2 1B-Instruct 模型权重（SafeTensors 格式）
+//   2) 分配 GPU buffer（attention/FFN 中间结果、KV cache、block table）
+//   3) 主推理循环：从 stdin 读 prompt → tokenize → prefill → decode 直到 EOS
+//   4) Continuous batching：BATCH_SIZE 个 sequence 槽位，prefill 和 decode 混合调度
+//
+// 文件结构（按位置）：
+//   L1-39    模型常量定义（Llama 3.2 1B 硬编码维度）
+//   L41-63   GPU 信息打印
+//   L65-78   Weights struct（所有权重的 GPU 指针）
+//   L80-148  loadWeights() — SafeTensors 解析 + 一次性 cudaMemcpy
+//   L150-554 prefill() — 处理一个 prompt，跑完整 16 层 transformer，生成第一个 token
+//   L556-1042 main() — 启动 / KV cache 分配 / decode 主循环
+//
+// 依赖的 kernels（kernels.cu）：
+//   prefill 用：embeddingGather / rmsNorm / rope / causalMask / softmax / silu / residualAdd
+//   decode 用：embeddingGatherDecode / rmsNorm / ropeDecode / pagedAttention / silu / residualAdd
+//   矩阵乘均通过 cublasGemmEx（不自己写 GEMM kernel，cublas 性能已经接近 peak）
+// =============================================================================
 #include <iostream>
 #include <numeric>
 #include <fstream>
@@ -10,33 +32,255 @@
 
 using json = nlohmann::json;
 
+// =============================================================================
+// 模型常量（Llama 3.2 1B-Instruct 硬编码）
+// -----------------------------------------------------------------------------
+// 这些数字都来自 HuggingFace 上 Llama 3.2 1B 的 config.json，目前没参数化。
+// 改其他模型必须重新编译并改这一段（这是 tiny-vllm 教学性质的明确取舍）。
+// =============================================================================
 constexpr int MAX_NEW_TOKENS_GENERATED = 20; // TODO: parameterize it with program arguments
 constexpr int B_TO_MB = 1024 * 1024;
 constexpr int B_TO_GB = 1024 * 1024 * 1024;
 constexpr int N_LAYERS = 16; // TODO: hardcoded for llama 3.2 1B, just like any other value for now
-constexpr int EMBEDDING_LENGTH = 2048;
-constexpr int HIDDEN_DIM = 8192;
-constexpr int KV_DIM = 512;
-constexpr int HEAD_DIM = 64;
-constexpr int NUM_Q_HEADS = 32;
-constexpr int NUM_K_HEADS = 8;
-constexpr int NUM_V_HEADS = 8;
-constexpr int GQA_Q_TO_K_RATIO = 4;
-constexpr int GQA_ATTN_SCORES_TO_V_RATIO = 4;
-constexpr int VOCAB_SIZE = 128256;
+constexpr int EMBEDDING_LENGTH = 2048;       // hidden dim, 即 d_model
+constexpr int HIDDEN_DIM = 8192;             // FFN intermediate size，4× embedding（标准 Transformer 比例）
+constexpr int KV_DIM = 512;                  // = NUM_K_HEADS × HEAD_DIM = 8 × 64
+constexpr int HEAD_DIM = 64;                 // 每个 attention head 的维度
+constexpr int NUM_Q_HEADS = 32;              // Query head 数（= EMBEDDING_LENGTH / HEAD_DIM = 2048/64）
+constexpr int NUM_K_HEADS = 8;               // GQA：Key head 数 = Q heads / 4
+constexpr int NUM_V_HEADS = 8;               // GQA：Value head 数（与 K head 一致）
+constexpr int GQA_Q_TO_K_RATIO = 4;          // 32 Q heads 共享 8 KV heads，比例 4:1
+constexpr int GQA_ATTN_SCORES_TO_V_RATIO = 4; // 同上，attention scores → V 的归约比例
+constexpr int VOCAB_SIZE = 128256;           // Llama 3 词表（比 Llama 2 的 32k 大很多，BPE 多语言扩充）
 constexpr int END_OF_TEXT_TOKEN_ID = 128001; // <|end_of_text|>
-constexpr int EOT_ID_TOKEN_ID = 128009;      // <|eot_id|>
+constexpr int EOT_ID_TOKEN_ID = 128009;      // <|eot_id|>，instruct 模型用的对话结束标记
 constexpr int MAX_SEQ_LEN = 2048;            // TODO: make it tunable
+
+// ---- Continuous batching 参数 ----
 constexpr int BATCH_SIZE = 2;                // TODO: not even close to being good, it's just here to have batching
 constexpr int MAX_PROMPT_LEN = 512;          // TODO: arbitrary, tunable
 constexpr int MAX_BUFFER_SIZE = std::max(MAX_PROMPT_LEN, BATCH_SIZE);
-constexpr int BLOCK_SIZE = 16; // TODO: tunable as well, defined the size of a single page in pagedattn
+
+// ---- PagedAttention 参数 ----
+// BLOCK_SIZE = 16 token/页（vLLM 论文用 16），太小→寻址开销大，太大→内存碎片多
+constexpr int BLOCK_SIZE = 16;                                    // TODO: tunable as well, defined the size of a single page in pagedattn
+// 一个物理块的字节布局：[K (BLOCK_SIZE × KV_DIM × bf16) | V (同上)]
+// V_OFFSET = 16 × 512 × 2 = 16384 字节 = 16KB（K 部分总大小）
 constexpr int V_OFFSET = BLOCK_SIZE * KV_DIM * sizeof(__nv_bfloat16);
-constexpr int BLOCK_BYTES = V_OFFSET * 2;                         // * 2 because K and V
+constexpr int BLOCK_BYTES = V_OFFSET * 2;                         // * 2 because K and V，总 32KB/块
 constexpr size_t KV_CACHE_SIZE_BYTES = 2ULL * 1024 * 1024 * 1024; // TODO: 2GB
 constexpr int MAX_BLOCKS_PER_SEQ = MAX_SEQ_LEN / BLOCK_SIZE;      // 2048 / 16 = 128
+// 65536 个物理块 × 32KB = 2GB（与 KV_CACHE_SIZE_BYTES 一致），可容纳的 token 总量 = 65536 × 16 = 1M token
 constexpr int NUM_BLOCKS = KV_CACHE_SIZE_BYTES / BLOCK_BYTES;     // 2*1024*1024*1024/(16*512*2*2) = 65536
 constexpr int MAX_SEQUENCES = BATCH_SIZE;
+
+// =============================================================================
+// 学习反问（main.cpp 整体设计层面）
+// ----- [Q] -----
+//   [QM1] 为什么 KV cache 一开始就分配 2GB 固定大小？vLLM 不是按需扩展吗？
+//   [QM2] BATCH_SIZE=2 这么小也算 batching 吗？典型生产配置是多少？
+//   [QM3] BLOCK_SIZE=16 / NUM_BLOCKS=65536 看起来"够用"，但内存碎片在哪里？
+// ----- [A]（答案在 main() 入口附近，搜索 [AM1]-[AM3]） -----
+// =============================================================================
+
+int checkGPUStatus()
+{
+    int device_count = 0;
+    cudaGetDeviceCount(&device_count);
+    if (device_count == 0)
+    {
+        std::cerr << "No CUDA devices found\n";
+        return 1;
+    }
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    std::cout << "Device: " << prop.name << "\n";
+    std::cout << "Compute capability: " << prop.major << "." << prop.minor << "\n";
+    std::cout << "Global memory: " << prop.totalGlobalMem / B_TO_MB << " MB\n";
+    std::cout << "SM count: " << prop.multiProcessorCount << "\n";
+    std::cout << "Max threads per block: " << prop.maxThreadsPerBlock << std::endl;
+    size_t free_mem;
+    size_t total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    std::cout << "Free memory: " << free_mem / B_TO_GB << "GB, total memory: " << total_mem / B_TO_GB << "GB\n";
+    return 0;
+}
+
+// =============================================================================
+// Weights — 模型权重在 GPU 上的访问入口
+// -----------------------------------------------------------------------------
+// 设计：所有权重共享一大块连续 GPU 显存（loadWeights 里一次性 cudaMalloc + memcpy），
+// 这个 struct 只存指向不同位置的指针偏移。
+//
+// 这是 SafeTensors 设计的好处：tensor 在文件里是连续二进制，加载就是 host→device
+// 的一次大块 memcpy，然后按 header 里的 offset 切出每个 tensor 的指针。
+//
+// 内存布局（按 N_LAYERS=16 计算）：
+//   embed_tokens         [128256, 2048] bf16   ≈ 525MB（vocab × hidden）
+//   per layer × 16:
+//     input_layernorm    [2048]                ≈ 4KB
+//     w_q                [2048, 2048]          ≈ 8MB
+//     w_k                [512, 2048]           ≈ 2MB（GQA 4:1，所以 K 比 Q 小 4×）
+//     w_v                [512, 2048]           ≈ 2MB
+//     w_o                [2048, 2048]          ≈ 8MB
+//     post_attn_layernorm[2048]                ≈ 4KB
+//     mlp_gate_proj      [8192, 2048]          ≈ 32MB
+//     mlp_up_proj        [8192, 2048]          ≈ 32MB
+//     mlp_down_proj      [2048, 8192]          ≈ 32MB
+//   norm                 [2048]                ≈ 4KB
+//   总计 ~1.74GB（Llama 3.2 1B bf16 实际 model.safetensors 文件大小）
+// =============================================================================
+struct Weights
+{
+    __nv_bfloat16 *embed_tokens;
+    __nv_bfloat16 *input_layernorm[N_LAYERS];
+    __nv_bfloat16 *mlp_gate_proj[N_LAYERS];
+    __nv_bfloat16 *mlp_up_proj[N_LAYERS];
+    __nv_bfloat16 *mlp_down_proj[N_LAYERS];
+    __nv_bfloat16 *post_attn_layernorms[N_LAYERS];
+    __nv_bfloat16 *w_k[N_LAYERS];
+    __nv_bfloat16 *w_o[N_LAYERS];
+    __nv_bfloat16 *w_q[N_LAYERS];
+    __nv_bfloat16 *w_v[N_LAYERS];
+    __nv_bfloat16 *norm;
+};
+
+// =============================================================================
+// loadWeights — 加载 model.safetensors 到 GPU
+// -----------------------------------------------------------------------------
+// SafeTensors 文件格式：
+//   [0:8]               header_size (uint64, little-endian)
+//   [8:8+header_size]   JSON header（描述每个 tensor 的 dtype / shape / offset）
+//   [8+header_size:]    所有 tensor 的连续二进制数据
+//
+// JSON header 示例（部分）：
+//   {
+//     "model.embed_tokens.weight": {
+//       "dtype": "BF16",
+//       "shape": [128256, 2048],
+//       "data_offsets": [0, 525336576]
+//     },
+//     "model.layers.0.self_attn.q_proj.weight": {
+//       "dtype": "BF16", "shape": [2048, 2048],
+//       "data_offsets": [525336576, 533725184]
+//     },
+//     ...
+//   }
+//
+// 加载流程：
+//   1) 读 header_size（前 8 字节）
+//   2) 读 JSON header
+//   3) 解析 JSON，记录每个 tensor 的 offset，找到 max_offset
+//   4) 按 max_offset cudaMalloc 一大块 GPU 显存
+//   5) 从文件读 max_offset 字节到 host vector
+//   6) 一次 cudaMemcpy 整体上传到 GPU
+//   7) 按 offset 算出每个 tensor 在 GPU 上的指针，存进 Weights struct
+//
+// ----- 学习反问（答案在 loadWeights 末尾） -----
+//   [Q1] 为什么不用 mmap + cudaHostRegister 直接零拷贝加载？
+//   [Q2] 如果 GPU 显存不够装下整个模型，能怎么改？
+// =============================================================================
+int loadWeights(Weights &weights)
+{
+    if (checkGPUStatus() != 0)
+    {
+        return 1;
+    }
+
+    // READ SAFETENSORS
+    std::ifstream safetensors_file("model.safetensors", std::ios_base::binary); // TODO: use args to provide the path or smth
+    if (!safetensors_file.is_open())
+    {
+        std::cout << "Can't open model.safetensors file\n";
+        safetensors_file.close();
+        return 1;
+    }
+
+    // READ SAFETENSORS HEADER SIZE
+    // SafeTensors 标准：前 8 字节小端序的 uint64，记录后续 JSON header 的字节数
+    uint64_t header_size;
+    safetensors_file.read(reinterpret_cast<char *>(&header_size), 8);
+    // READ SAFETENSORS HEADER
+    std::string header;
+    header.resize(header_size);
+    safetensors_file.read(header.data(), header_size);
+    // READ OFFSETS OF EVERY LAYER (TENSOR) TO KNOW WHERE EVERY LAYER STARTS AND ENDS IN THE MEMORY
+    // 解析 JSON header，提取每个 tensor 的起始 offset；找最大 end offset 决定要分配多大显存
+    std::unordered_map<std::string, uint64_t> offsets;
+    json header_json = json::parse(header);
+    uint64_t max_offset = 0;
+    for (auto &[key, value] : header_json.items())
+    {
+        if (key == "__metadata__")
+        {
+            continue;
+        }
+        uint64_t offset_end = value["data_offsets"].at(1).get<uint64_t>();
+        if (offset_end > max_offset)
+        {
+            max_offset = offset_end;
+        }
+        offsets[key] = value["data_offsets"].at(0).get<uint64_t>();
+    }
+
+    // 一次性分配整块模型显存。max_offset 是所有 tensor 的最右边界。
+    // 注意：data_offsets 是相对于 binary 数据段（不是文件起点）的偏移，所以
+    // GPU 这里直接用 max_offset 大小就够了。
+    void *model_weights;
+    cudaMalloc(&model_weights, max_offset); // max_offset tells where the model weights end in the memory
+
+    // CPU 暂存：从文件读到 host 内存，再一次 cudaMemcpy 全量上传 GPU
+    // 不做分块/流式：1.7GB 在 PCIe 4.0 x16 上 ~250ms 内完成，可以接受
+    std::vector<char> model_weights_cpu;
+    model_weights_cpu.resize(max_offset);
+    safetensors_file.read(model_weights_cpu.data(), max_offset);
+
+    cudaMemcpy(model_weights, model_weights_cpu.data(), max_offset, cudaMemcpyHostToDevice);
+    safetensors_file.close();
+    // BASICALLY A HELPER STRUCT TO HAVE AN EASY ACCESS TO ANY MODEL WEIGHTS ON GPU
+    // TODO: right now I know the model structure since it's always llama 3.2 1B-Instruct, but maybe it would be convenient
+    //       to store dimensions somewhere for even easier access?
+    // 按 offset 算出每个 tensor 在 GPU 上的指针。所有指针都指向 model_weights 这块连续显存的不同位置
+    weights.embed_tokens = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.embed_tokens.weight"));
+    weights.norm = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.norm.weight"));
+    for (int i = 0; i < N_LAYERS; ++i)
+    {
+        // HuggingFace 命名约定：model.layers.{i}.{component}.weight
+        weights.input_layernorm[i] = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.layers." + std::to_string(i) + ".input_layernorm.weight"));
+        weights.mlp_down_proj[i] = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.layers." + std::to_string(i) + ".mlp.down_proj.weight"));
+        weights.mlp_gate_proj[i] = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"));
+        weights.mlp_up_proj[i] = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.layers." + std::to_string(i) + ".mlp.up_proj.weight"));
+        weights.post_attn_layernorms[i] = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"));
+        weights.w_k[i] = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.layers." + std::to_string(i) + ".self_attn.k_proj.weight"));
+        weights.w_o[i] = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.layers." + std::to_string(i) + ".self_attn.o_proj.weight"));
+        weights.w_q[i] = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.layers." + std::to_string(i) + ".self_attn.q_proj.weight"));
+        weights.w_v[i] = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.layers." + std::to_string(i) + ".self_attn.v_proj.weight"));
+    }
+    // ---------------------------------------------------------------------
+    // 反问答案
+    // [A1] 完全可以而且更高效。SafeTensors 的设计就是 mmap-friendly：tensor
+    //      在文件里连续，按 dtype 自然对齐。生产实现（如 vLLM、HuggingFace
+    //      transformers + accelerate）的做法：
+    //        1) mmap 文件 → 拿到 CPU 虚拟地址
+    //        2) cudaHostRegister 把 mmap 区域 pin 住（让 cudaMemcpyAsync 走 DMA）
+    //        3) cudaMemcpyAsync 异步拷贝（甚至可以做按需分层加载）
+    //      这样省去：a) std::vector<char> 中间拷贝（节省 1.7GB host 内存）
+    //              b) 同步等待全量加载完成
+    //      Tiny-vLLM 用同步 read + memcpy 是教学简洁优先。
+    //
+    // [A2] 几种渐进方案：
+    //        a) 量化（bf16 → int8/int4）：1.7GB → 0.85GB / 0.43GB（参考 Lab 4 量化对比）
+    //        b) 只把当前需要的 layer 权重放 GPU，其他流式加载（layer offloading）
+    //        c) CPU offloading：weight 留 CPU pinned memory，每层 forward 前 prefetch
+    //        d) 多 GPU tensor parallelism：weight 切片到多卡（vLLM tp 实现）
+    //      Tiny-vLLM 假设单 GPU 显存够用，没做这些。Llama 3.2 1B bf16 在
+    //      RTX 5090（32GB）上完全装得下。
+    // ---------------------------------------------------------------------
+    return 0;
+}
+
+// TODO: clean up this mess lol XD (I mean, the arguments list is so long, but maybe that's unavoidable, I don't know yet)
 
 int checkGPUStatus()
 {
