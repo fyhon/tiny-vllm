@@ -80,7 +80,7 @@ constexpr int MAX_SEQUENCES = BATCH_SIZE;
 //   [QM1] 为什么 KV cache 一开始就分配 2GB 固定大小？vLLM 不是按需扩展吗？
 //   [QM2] BATCH_SIZE=2 这么小也算 batching 吗？典型生产配置是多少？
 //   [QM3] BLOCK_SIZE=16 / NUM_BLOCKS=65536 看起来"够用"，但内存碎片在哪里？
-// ----- [A]（答案在 main() 入口附近，搜索 [AM1]-[AM3]） -----
+// ----- [A]（答案在 main() 中 Stage F 之前的 [AM1]-[AM3] 区块） -----
 // =============================================================================
 
 int checkGPUStatus()
@@ -914,8 +914,28 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
     // =====================================================================
 }
 
+// =============================================================================
+// main — 推理引擎主入口
+// -----------------------------------------------------------------------------
+// 职责（按时间顺序）：
+//   Stage A: 初始化 cublas + 加载权重
+//   Stage B: KV cache 三件套（kv_cache 显存 / free_blocks 池 / block_table 索引）
+//   Stage C: 硬编码 4 个 prompt 入队（教学用，没接 stdin 或 socket）
+//   Stage D: Batch 调度状态（哪些 slot 在用、各自生成到哪）
+//   Stage E: 大量 GPU buffer 分配（attention/FFN 中间结果）+ cublas 标量
+//   Stage F: 第一轮 prefill：填满 BATCH_SIZE 个 slot
+//   Stage G: 主循环 while(true)
+//            ├─ 空闲 slot 接队列里下一个 prompt（继续 prefill）
+//            ├─ 收集 active_slots / active_tokens / seq_lens 上传 GPU
+//            └─ 16 层 decode（详见 Part 4 注释）
+//
+// ----- 学习反问（答案在 Stage F 之前的 [AM1]-[AM3] 区块，对应文件顶部的 [QM1]-[QM3]） -----
+// =============================================================================
 int main(int argc, char *argv[])
 {
+    // ---- Stage A: cublas + Weights ----
+    // cublas 是 GEMM 的工具，整个推理流程的所有矩阵乘都用它（Q/K/V proj、attn QK^T、
+    // attn × V、O proj、gate/up/down、lm_head），自己写 kernel 性能比不过
     cublasHandle_t cublas_handle;
     cublasStatus_t status = cublasCreate(&cublas_handle);
     if (status != CUBLAS_STATUS_SUCCESS)
@@ -930,15 +950,40 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    // ---- Stage B: KV cache 三件套 ----
+    // 这是 PagedAttention 的核心数据结构组合：
+    //   1) kv_cache —— GPU 上一大块连续 2GB 显存，划分成 NUM_BLOCKS=65536 个固定大小物理块
+    //      每块 32KB = [K (BLOCK_SIZE × KV_DIM × bf16) | V (同上)]
+    //   2) free_blocks —— CPU vector 用作"空闲物理块栈"，初始装 [0, 1, ..., 65535]
+    //                     prefill 时 pop_back 拿一块，slot 释放时 push_back 还回来
+    //   3) block_table —— CPU vector 索引 [slot, layer, logical_block_idx] → physical_block_id
+    //                     初始全 -1（表示"未分配"），prefill 写入分配的物理块编号
+    //                     用前同步到 block_table_gpu 让 pagedAttention kernel 能读
+    //
+    // 这是教学版的设计取舍：CPU 维护分配状态、GPU 只负责"用 block_table 间接寻址"。
+    // 生产版（vLLM BlockManager）通常 GPU 上维护 free list，避免每次 prefill 都同步
     // allocator for pagedattn
     __nv_bfloat16 *kv_cache;
-    cudaMalloc(&kv_cache, KV_CACHE_SIZE_BYTES);
+    cudaMalloc(&kv_cache, KV_CACHE_SIZE_BYTES);                      // 2GB 显存
     std::vector<int> free_blocks(NUM_BLOCKS);
-    std::iota(free_blocks.begin(), free_blocks.end(), 0);
+    std::iota(free_blocks.begin(), free_blocks.end(), 0);            // [0, 1, 2, ..., 65535]
+    // block_table 三维：[BATCH_SIZE × N_LAYERS × MAX_BLOCKS_PER_SEQ] = [2 × 16 × 128] = 4096 entries
+    // 实际寻址：block_table[slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + lblock]
     std::vector<int> block_table(MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ, -1);
     int *block_table_gpu;
     cudaMalloc(&block_table_gpu, MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int));
 
+    // ---- Stage C: 4 个硬编码 prompt（Llama 3 chat 格式） ----
+    // 每个 prompt 都包了 Llama 3 的 chat 模板 token：
+    //   128000 = <|begin_of_text|>
+    //   128006 = <|start_header_id|>，128007 = <|end_header_id|>
+    //   882   = "user"
+    //   271   = "\n\n"（双换行，prompt 与 system header 分隔）
+    //   78191 = "assistant"
+    //   128009 = <|eot_id|>（end of turn）
+    // 中间是真正的内容 token（数字 / 字母 BPE 分割）
+    // 实际格式：<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+    // 这是 instruct 模型必须的格式，否则模型会困惑（base 模型不需要这些）
     // PROMPT 0 (What is 2+2?) - length 17
     std::queue<std::vector<int>> queue;
     queue.push({128000, 128006, 882, 128007, 271, 3923, 374, 220, 17, 10, 17, 30, 128009, 128006, 78191, 128007, 271});
@@ -952,6 +997,15 @@ int main(int argc, char *argv[])
     // PROMPT 3 (Capital of France?) - length 14
     queue.push({128000, 128006, 882, 128007, 271, 64693, 315, 9822, 30, 128009, 128006, 78191, 128007, 271});
 
+    // ---- Stage D: Batch 调度状态 ----
+    // BATCH_SIZE=2 个 slot，每个 slot 是一个"正在生成中的 sequence"
+    // 这是 continuous batching 的核心：slot 数固定，但流过的 sequence 数无限——
+    //   slot 完成（生成 EOS）后释放给下一个 prompt，不需要等整 batch 同步
+    //
+    // is_slot_free: 各 slot 状态（true = 空闲, false = 占用）
+    // generated_tokens: 各 slot 已生成的 token list（用于完成时输出文本）
+    // last_generated_tokens: 各 slot 上次生成的 token，下一轮 decode 的输入
+    // current_prompt_len: 各 slot 当前 KV cache 实际占用长度（每生成一个 token +1）
     // BATCH
     std::vector<bool> is_slot_free(BATCH_SIZE, true); // set to false when slot taken, set to true when free
 
@@ -959,6 +1013,9 @@ int main(int argc, char *argv[])
     std::vector<int> last_generated_tokens(BATCH_SIZE);
     std::vector<int> current_prompt_len(BATCH_SIZE, 0);
 
+    // active_slots / active_tokens：每轮 decode 前从 BATCH_SIZE 中筛选出"还在生成中"的 slot
+    // 因为 BATCH_SIZE 个 slot 不一定都活跃（某些可能 EOS 释放，某些可能还没收到 prompt）
+    // pagedAttention 只在 active 的 slot 上做计算（gpu_active_slots 把这个映射传给 GPU）
     // needed to provide contiguous data for decode
     std::vector<int> active_slots;
     std::vector<int> active_tokens;
@@ -970,6 +1027,46 @@ int main(int argc, char *argv[])
 
     // TODO: recalculate input_tokens_size and prompt_lengths always when there is a change to prompt_under_prefill
     // TODO: right now I handle input manually, it's the least interesting part, will come back to it when continuous batching and pagedattn works
+
+    // ---- Stage E: GPU buffer pool 分配 ----
+    // 这是 main() 里最长的一段——给所有中间结果分配 GPU 显存。
+    // buffer 大小都按"最大可能用量"算（MAX_BUFFER_SIZE = max(MAX_PROMPT_LEN=512, BATCH_SIZE=2)）
+    // 这样 prefill（最多 512 token）和 decode（每轮最多 BATCH_SIZE 个）都能复用同一块。
+    //
+    // ----- buffer 列表（与 prefill() 50+ 参数对应） -----
+    // prompt 输入：
+    //   gpu_input_tokens [MAX_PROMPT_LEN]    int   prompt token ids
+    //   input_embeddings [MAX_PROMPT_LEN, 2048] bf16  embedding lookup 结果
+    //
+    // 主推理通路（每层都用）：
+    //   hidden_state [MAX_BUFFER_SIZE, 2048]  bf16  各层 hidden（持续累加 residual）
+    //   rms_norms    [MAX_BUFFER_SIZE, 2048]  bf16  rmsNorm 输出（每层 attention 和 FFN 前各用一次）
+    //
+    // 复用 buffer（buffer pool 的核心精髓 —— 详见 prefill 反问 [AP2]）：
+    //   buf_2048_1 [MAX_BUFFER_SIZE, 2048]   bf16  q_proj 阶段 → attn_scores_v 阶段
+    //   buf_2048_2 [MAX_BUFFER_SIZE, 2048]   bf16  o_proj 阶段 → down 阶段
+    //
+    // K/V 临时（attention 算完就写 KV cache，不需要 MAX_BUFFER_SIZE 那么大）：
+    //   k_proj_temp_buf [MAX_PROMPT_LEN, 512] bf16  prefill K，写入 KV cache 后即释放
+    //   v_proj_temp_buf [MAX_PROMPT_LEN, 512] bf16  prefill V，同上
+    //
+    // attention 矩阵（prefill 独有，因为 [N, N] 需要 prompt_len² 显存，decode 走 pagedAttention 不存这个）：
+    //   prefill_attn_scores [NUM_Q_HEADS, MAX_PROMPT_LEN, MAX_PROMPT_LEN] bf16
+    //     32 × 512 × 512 × 2B = 16MB（这就是为什么 prefill 不能直接 batch ：每个 prompt 都要这块）
+    //
+    // FFN 中间：
+    //   gate / up [MAX_BUFFER_SIZE, 8192]    bf16  SwiGLU 的两条投影
+    //   embed_proj [MAX_BUFFER_SIZE, 128256] bf16  最终 logits（vocab 维度）
+    //
+    // ⚠️ down 没有 cudaMalloc：直接复用 buf_2048_2（见 prefill stage 2.10）
+    //
+    // ----- cublas alpha/beta 标量 -----
+    // 每个 GEMM 调用 GEMM(C = α·A·B + β·C)。这里几乎所有 GEMM 都是 α=1, β=0
+    //   （即 C = A·B 直接覆盖）。
+    // 唯一例外：attn_alpha = 1/sqrt(64) = 0.125（attention scaling 直接乘进 GEMM）
+    //
+    // 标量预定义而不是临时构造，因为 cublasGemmEx 要求 alpha/beta 是指针——
+    // 局部变量在每次循环都重建，标量地址不变更省事
 
     std::vector<int> prompt;
     int prompt_len;
@@ -1005,7 +1102,7 @@ int main(int argc, char *argv[])
 
     __nv_bfloat16 *prefill_attn_scores;
     cudaMalloc(&prefill_attn_scores, MAX_PROMPT_LEN * MAX_PROMPT_LEN * sizeof(__nv_bfloat16) * NUM_Q_HEADS);
-    float attn_alpha = 1.0f / 8.0f;
+    float attn_alpha = 1.0f / 8.0f;  // = 1/sqrt(HEAD_DIM=64)，attention scaling
     float attn_beta = 0.0f;
 
     __nv_bfloat16 *attn_scores_v;
@@ -1028,7 +1125,7 @@ int main(int argc, char *argv[])
     float up_alpha = 1.0f;
     float up_beta = 0.0f;
 
-    __nv_bfloat16 *down;
+    __nv_bfloat16 *down;  // 不分配，复用 buf_2048_2
     float down_alpha = 1.0f;
     float down_beta = 0.0f;
 
@@ -1037,13 +1134,18 @@ int main(int argc, char *argv[])
     float embed_alpha = 1.0f;
     float embed_beta = 0.0f;
 
+    // logits 在 CPU 上的暂存空间（argmax 在 CPU 做，详见 prefill 反问 [AP3]）
     std::vector<__nv_bfloat16> embed_proj_cpu;
     embed_proj_cpu.resize(MAX_BUFFER_SIZE * VOCAB_SIZE);
+    // ---- decode-only buffer ----
+    // gpu_last_tokens: decode 时每个 active slot 上一轮生成的 token id
     // decode-only allocation
     int *gpu_last_tokens;
     cudaMalloc(&gpu_last_tokens, BATCH_SIZE * sizeof(int));
     // TODO: move argmax to GPU and get rid of these CPU<->GPU tokens moves
 
+    // decode 时 K/V proj 临时 buffer：每轮只生成 1 token/slot，所以维度只需要 BATCH_SIZE
+    // 与 prefill 用 MAX_PROMPT_LEN 维度的 k_proj_temp_buf 不同
     // reused temporary buffers for K and V cache computation during decode
     __nv_bfloat16 *k_proj_batched_buffer;
     cudaMalloc(&k_proj_batched_buffer, BATCH_SIZE * sizeof(__nv_bfloat16) * KV_DIM);
@@ -1051,6 +1153,50 @@ int main(int argc, char *argv[])
     __nv_bfloat16 *v_proj_batched_buffer;
     cudaMalloc(&v_proj_batched_buffer, BATCH_SIZE * sizeof(__nv_bfloat16) * KV_DIM);
 
+    // =========================================================================
+    // 文件级反问答案（对应文件顶部 [QM1]-[QM3]）
+    // -------------------------------------------------------------------------
+    // [AM1] 静态分配 2GB 是教学版的简化。理由：
+    //         a) 用 cudaMalloc 一次到位，避免运行时显存分片
+    //         b) NUM_BLOCKS=65536 上限充足（覆盖 ~1M token），实际 BATCH_SIZE=2
+    //            × MAX_SEQ_LEN=2048 只会用 256 块
+    //       生产 vLLM 的做法：
+    //         a) 启动时按"剩余显存 - 模型权重 - 激活 buffer"自动算 KV cache 大小
+    //            （--gpu-memory-utilization=0.9）
+    //         b) 仍然预分配（避免运行时碎片），但根据实际硬件灵活
+    //         c) 跨 GPU tensor parallel 时按 tp_size 分摊
+    //       重点：vLLM 也是"启动时分配，不是按需扩展"——按需 cudaMalloc 性能太差
+    //       （~10us/次）。"按需扩展"指的是 logical block 按需分配（block_table 写入），
+    //       不是物理显存。
+    //
+    // [AM2] BATCH_SIZE=2 是教学占位，生产配置取决于：
+    //         a) 模型大小 → KV cache 显存（每 token 占用 = 2×layers×kv_dim×bytes）
+    //            Llama 3.2 1B: 2×16×512×2 = 32KB/token
+    //            Llama 3 70B: 2×80×8192×2 = 2.5MB/token （×80 倍）
+    //         b) 平均序列长度 → 单 sequence KV cache 总量
+    //         c) GPU 显存（H100 80GB / RTX 5090 32GB）
+    //       典型生产配置：vLLM 默认 max_num_seqs=256（动态浮动），实际并发可能
+    //       50-200。SGLang 类似。Tiny-vLLM 升到 256 需要把 prefill_attn_scores
+    //       buffer 也按 BATCH_SIZE 扩，显存压力会爆。
+    //
+    // [AM3] 内部碎片来自三个层面：
+    //         a) Block 内碎片：sequence 长度不是 BLOCK_SIZE=16 的整数倍时，最后
+    //            一块只用一部分。例如 17 token = 2 块（第 2 块只用 1/16）
+    //            浪费率 = 1 - (avg_seq_len / BLOCK_SIZE) % 1，期望浪费 ~50%
+    //            of 一个 block = 8 token / sequence
+    //         b) 分配粒度碎片：BLOCK_SIZE 越大，内部碎片越严重；越小，间接寻址
+    //            开销越大。vLLM 默认 16 是经验权衡值
+    //         c) Per-layer 重复：每个 layer 一个 block_table，N_LAYERS=16 倍。
+    //            实际上每 layer 同一逻辑位置都需要单独物理块（K/V 数据不同）
+    //       对比传统 contiguous KV cache：每个 sequence 预分配 MAX_SEQ_LEN，
+    //       浪费率 = 1 - actual_len/MAX_SEQ_LEN，长度短时浪费 90%+。PagedAttention
+    //       把这个"sequence 级"碎片（>50%）变成"block 级"碎片（<5%）。
+    // =========================================================================
+
+    // ---- Stage F: 第一轮 prefill 调度 ----
+    // 启动时 BATCH_SIZE 个 slot 全空，从 queue 拉 prompt 填满
+    // 简单模式：slot 0 取第一个 prompt，slot 1 取第二个，依次类推
+    // is_slot_free 在 prefill 内部会被改成 false（标记占用）
     for (int slot = 0; slot < is_slot_free.size() && !queue.empty(); ++slot)
     {
         if (!is_slot_free[slot])
@@ -1076,27 +1222,41 @@ int main(int argc, char *argv[])
     // DECODE
     // since now I operate always on index 0 for all values and for current_position_token for new K and V
 
+    // ---- Stage G: 主循环 while(true) ----
+    // continuous batching 的调度入口：
+    //   每轮 = (空闲 slot 接 prompt 走 prefill) + (active slot 集体走 decode 1 步)
+    //
+    // 这就是为什么 LLM serving 引擎能边来 prompt 边返结果——slot 之间互相不干扰，
+    // prefill 和 decode 在同一个 batch 内"分工"（vLLM 称为 hybrid execution）。
+    //
+    // ⚠️ Tiny-vLLM 的简化：prefill 和 decode 在 main() 里串行执行（先 prefill 完所有
+    // 空 slot 再 decode 一步）。生产 vLLM 用 chunked prefill + decode mixed scheduling
+    // 让两者并行（详见 wiki/track-a/phase-2/chunked-prefill.md）
     while (true) // exit condition irrelevant for now, since it's an inference server that's supposed to run foreveeer!!!
     {
         active_slots.clear();
         active_tokens.clear();
+        // ---- G.1: 扫描所有 slot：空闲的接 prompt（prefill），占用的加入 active_slots ----
         for (int slot = 0; slot < BATCH_SIZE; ++slot)
         {
             if (is_slot_free[slot])
             {
+                // 空 slot：从队列拉下一个 prompt（如果队列空就跳过）
                 if (queue.empty())
                 {
                     continue;
                 }
-                generated_tokens[slot].clear();
+                generated_tokens[slot].clear();  // 清空上次该 slot 生成的 token list
                 prefill(prompt, queue, prompt_len, is_slot_free, slot, gpu_input_tokens, input_embeddings, weights, hidden_state, rms_norms, q_proj, buf_2048_1, cublas_handle, q_proj_alpha, q_proj_beta, k_proj_alpha, k_proj_beta, v_proj_alpha, v_proj_beta, prefill_attn_scores, attn_alpha, attn_beta, attn_scores_v, attn_scores_v_alpha, attn_scores_v_beta, o_proj, buf_2048_2, o_proj_alpha, o_proj_beta, gate_alpha, gate_beta, gate, up_alpha, up_beta, up, down, down_alpha, down_beta, embed_alpha, embed_beta, embed_proj, embed_proj_cpu, generated_tokens, last_generated_tokens, current_prompt_len, k_proj_temp_buf, v_proj_temp_buf, block_table, block_table_gpu, free_blocks, kv_cache);
             }
+            // 占用 slot（包括刚 prefill 完的）：加入 decode 名单
             active_slots.push_back(slot);
             active_tokens.push_back(last_generated_tokens[slot]);
         }
         int num_active_slots = active_slots.size();
         if (num_active_slots == 0)
         {
+            // 没有 active slot：要么队列空 → 退出；要么暂时全空闲 → 继续等
             if (queue.empty())
             {
                 break; // TODO: continue will make sense when I will finally write to queue, for now it has predefined size so break instead
@@ -1104,6 +1264,12 @@ int main(int argc, char *argv[])
             continue;
         }
 
+        // ---- G.2: decode 准备：把 batch 状态上传到 GPU ----
+        // gpu_last_tokens [num_active_slots]   各 slot 上一轮生成的 token id（decode 输入）
+        // gpu_active_slots [num_active_slots]  各 active slot 在 BATCH_SIZE 中的位置
+        //                                       pagedAttention kernel 用它在 block_table 中索引
+        // gpu_seq_lens [num_active_slots]      各 slot 当前 KV cache 长度（含 prefill prompt + 已生成）
+        //                                       +1 是因为本轮的新 token 也算在 KV cache 里
         // copy useful data to gpu
         cudaMemcpy(gpu_last_tokens, active_tokens.data(), num_active_slots * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(gpu_active_slots, active_slots.data(), num_active_slots * sizeof(int), cudaMemcpyHostToDevice);
