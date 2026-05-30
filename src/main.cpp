@@ -1281,18 +1281,55 @@ int main(int argc, char *argv[])
         }
         cudaMemcpy(gpu_seq_lens, seq_lens.data(), seq_lens.size() * sizeof(int), cudaMemcpyHostToDevice);
 
+        // =====================================================================
+        // ---- Stage G.3: 16 层 decode transformer 主循环 ----
+        // 与 prefill 11 子步骤一一对偶，但所有 N（prompt_len）→ 1 token/slot：
+        //   G.3.1 embeddingGatherDecode                  (per slot 取上一 token embedding)
+        //   G.3.2 input rmsNorm
+        //   G.3.3 Q/K/V proj (输出每 slot 1 token)
+        //   G.3.4 RoPE (per slot 逐个 position 调用 ropeDecode)
+        //   G.3.5 K/V 写入 KV cache (per slot 写 1 token，新 block 才 free_blocks.pop_back)
+        //   G.3.6 block_table CPU→GPU 同步 ⚠️ 每 layer 都做（性能问题，见反问 [QD3]）
+        //   G.3.7 pagedAttention (替代 prefill 的 cublas QK + mask + softmax + cublas V)
+        //   G.3.8 O proj + residualAdd
+        //   G.3.9 post-attn rmsNorm
+        //   G.3.10 gate / up / silu(gate, up) / down
+        //   G.3.11 FFN residualAdd
+        //
+        // ----- 学习反问（答案在 main 末尾 [AD1]-[AD5]） -----
+        //   [QD1] decode 阶段维度从 [N, 2048] 变 [num_active_slots, 2048]，
+        //         同样的 GEMM 在 decode 比 prefill 慢还是快？为什么？
+        //   [QD2] 为什么 decode 用 pagedAttention kernel 而 prefill 用 cublas 4 步？
+        //         pagedAttention 在 prefill 也能用吗？
+        //   [QD3] block_table 在 decode 每 layer 都同步一次（16 次/decode step），
+        //         相比 prefill 末尾只同步一次，多了多少开销？怎么优化？
+        //   [QD4] decode 时 ropeDecode 用 per-slot for loop 调用（kernels.cu ropeKernelDecode），
+        //         为什么不像 prefill 的 rope 那样一次 launch 处理所有 token？
+        //   [QD5] EOS 检测在 CPU 上做（看 max_token_idx），为什么不放 GPU？
+        // =====================================================================
+
+        // ---- G.3.1 embedding lookup（decode 版）----
+        // 每个 active slot 取自己上一轮生成的 token 的 embedding
+        // 与 prefill 的 embeddingGather 不同：
+        //   prefill：1 个 sequence × N 个 token → [N, 2048]
+        //   decode：num_active_slots 个 sequence × 1 token/slot → [num_active_slots, 2048]
         embeddingGatherDecode(gpu_last_tokens, num_active_slots, hidden_state, weights.embed_tokens);
         for (int layer = 0; layer < N_LAYERS; ++layer)
         {
+            // ---- G.3.2 input rmsNorm ----
             rmsNorm(hidden_state, rms_norms, weights.input_layernorm[layer], num_active_slots);
+            // ---- G.3.3 Q/K/V 投影 ----
+            // 与 prefill 同 cublas trick，但维度从 [N, 2048] 变 [num_active_slots, 2048]
+            // num_active_slots ≤ BATCH_SIZE = 2，所以这里 GEMM 是窄长矩阵——这就是
+            // decode memory-bound 的根源（GEMM 形状不利于 tensor core 利用率）
             q_proj = buf_2048_1;
             // q proj (num_prompts, 2048)
             cublasGemmEx(cublas_handle,
                          CUBLAS_OP_T,
                          CUBLAS_OP_N,
-                         EMBEDDING_LENGTH, // m
-                         num_active_slots, // n
-                         EMBEDDING_LENGTH, // k
+                         EMBEDDING_LENGTH, // m = 2048（输出 hidden）
+                         num_active_slots, // n = 活跃 slot 数（典型 1-2）
+                         EMBEDDING_LENGTH, // k = 2048
                          &q_proj_alpha,
                          weights.w_q[layer], // A
                          CUDA_R_16BF,
@@ -1306,6 +1343,10 @@ int main(int argc, char *argv[])
                          EMBEDDING_LENGTH, // ldc
                          CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT);
+            // K 投影（decode 版）：写入 k_proj_batched_buffer 而不是直接写 KV cache
+            // 因为：1) num_active_slots 个 slot 在 buffer 里连续排列
+            //       2) 各 slot 在 KV cache 中的物理块是分散的（block_table 间接寻址）
+            //       3) cublas 输出连续 → 然后 per-slot scatter 到对应物理块
             // k proj (1, 512), writing output to next position in current layer's K cache
             // K proj = rms_norms (num_prompt, 2048) * W_k (512, 2048)
             // W_k is actually stored as 512, 2048 (out features, in features)
@@ -1339,12 +1380,13 @@ int main(int argc, char *argv[])
                          CUDA_R_16BF,
                          EMBEDDING_LENGTH, // ldb, same reason for rms_norms
                          &k_proj_beta,
-                         k_proj_batched_buffer, // TODO C
+                         k_proj_batched_buffer, // [num_active_slots, 512]
                          CUDA_R_16BF,
                          KV_DIM, // ldc = 512
                          CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT);
 
+            // V 投影：与 K 同模式
             // same
             cublasGemmEx(cublas_handle,
                          CUBLAS_OP_T,
@@ -1366,42 +1408,74 @@ int main(int argc, char *argv[])
                          CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT);
 
+            // ---- G.3.4 RoPE per slot ----
+            // ⚠️ 每个 slot 的 position 不同（不同 sequence 长度），所以无法批量 launch
+            // for loop 调用 num_active_slots 次 ropeDecode kernel
+            // 优化方向（反问 [QD4]）：写一个支持 per-token position 的 batched RoPE kernel
             for (int slot = 0; slot < num_active_slots; ++slot)
             {
                 int active_slot = active_slots[slot];
+                // 注意 q_proj[slot * EMBEDDING_LENGTH] 而不是 active_slot —— 因为
+                // q_proj 已经是 [num_active_slots, 2048] 的紧凑布局
                 ropeDecode(&q_proj[slot * EMBEDDING_LENGTH], current_prompt_len[active_slot], EMBEDDING_LENGTH);
                 ropeDecode(k_proj_batched_buffer + slot * KV_DIM, current_prompt_len[active_slot], KV_DIM);
             }
 
+            // ---- G.3.5 把 K, V 写入 PagedAttention 物理块（per slot 单 token）----
+            // 与 prefill 的差异（关键！）：
+            //   prefill：[N, 512] 按 BLOCK_SIZE=16 切片整块写
+            //   decode：每 slot 1 个 token，写在该 slot 对应物理块的"下一个空位"
+            //          只在该 slot 的 seq_len 跨过新 BLOCK_SIZE 边界时才分配新块
             // PagedAttn scatter k and v from a temp buffer, like in the prefill
             for (int slot = 0; slot < num_active_slots; ++slot)
             {
                 int active_slot = active_slots[slot];
+                // current_prompt_len 是"上一轮已写入 KV cache 的 token 数"（不含本轮）
+                // 本轮要写的位置 = current_prompt_len（这是 0-indexed）
                 int seq_len = current_prompt_len[active_slot]; // + generated tokens?
                 int logical_block_idx = seq_len / BLOCK_SIZE;
                 int token_in_block_idx = seq_len % BLOCK_SIZE;
                 int block = block_table[active_slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx];
                 if (token_in_block_idx == 0)
                 {
+                    // 块内第一个位置 → 这个逻辑块还没分配物理块，从 free_blocks 取一个
+                    // 注意 prefill 走的是同一逻辑（block == -1 时分配）但 prefill 整块预分配
                     int physical_block_idx = free_blocks.back();
                     free_blocks.pop_back();
                     block = physical_block_idx;
                     block_table[active_slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx] = block;
                 }
+                // 写 K：跳到该物理块 + token_in_block_idx 位置
                 __nv_bfloat16 *k_cache_ptr = (__nv_bfloat16 *)((char *)kv_cache + block * BLOCK_BYTES + token_in_block_idx * KV_DIM * sizeof(__nv_bfloat16));
                 __nv_bfloat16 *k_proj_ptr = k_proj_batched_buffer + slot * KV_DIM;
                 cudaMemcpy(k_cache_ptr, k_proj_ptr, KV_DIM * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
 
+                // 写 V：同 K，但 + V_OFFSET（物理块内 V 部分起点）
                 __nv_bfloat16 *v_cache_ptr = (__nv_bfloat16 *)((char *)kv_cache + block * BLOCK_BYTES + V_OFFSET + token_in_block_idx * KV_DIM * sizeof(__nv_bfloat16));
                 __nv_bfloat16 *v_proj_ptr = v_proj_batched_buffer + slot * KV_DIM;
                 cudaMemcpy(v_cache_ptr, v_proj_ptr, KV_DIM * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
             }
 
+            // ---- G.3.6 block_table CPU → GPU 同步 ⚠️（每 layer 都做）----
+            // 因为 G.3.5 可能改了 block_table（新分配物理块），下面 pagedAttention 要读
+            // 但每 layer 都同步整张表（16KB × 16 layer = 256KB / decode step）效率低
+            // 反问 [QD3] 答案给出优化方向
             // synchronize block table on cpu with block table on gpu (for attention)
             cudaMemcpy(block_table_gpu, block_table.data(), MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int), cudaMemcpyHostToDevice);
 
+            // ---- G.3.7 pagedAttention（decode 的核心 kernel）----
+            // 替代了 prefill 的 4 步（cublas QK + causalMask + softmax + cublas ×V）
+            // 内部融合了：online softmax + 跨 warp reduce + GQA + PagedAttention 寻址
+            // 详见 kernels.cu pagedAttentionKernel 的完整注释
+            //
+            // 输入：q_proj [num_active_slots, 2048], kv_cache（间接寻址）
+            // 输出：buf_2048_1（覆盖 q_proj，因为 q_proj = buf_2048_1）
+            //
+            // 注意：buf_2048_1 既是输入（q_proj）也是输出。pagedAttention 内部
+            // 先把 q 读到寄存器，再写 output，所以 in-place 是安全的
             pagedAttention(layer, num_active_slots, q_proj, kv_cache, block_table_gpu, gpu_seq_lens, gpu_active_slots, buf_2048_1);
 
+            // ---- G.3.8 O 投影 + residualAdd ----
             o_proj = buf_2048_2;
             // (1, 2048) * (2048, 2048) -> (1, 2048)
             cublasGemmEx(cublas_handle,
@@ -1414,7 +1488,7 @@ int main(int argc, char *argv[])
                          weights.w_o[layer],
                          CUDA_R_16BF,
                          EMBEDDING_LENGTH,
-                         buf_2048_1,
+                         buf_2048_1,        // attention 输出（pagedAttention 写到这里）
                          CUDA_R_16BF,
                          EMBEDDING_LENGTH,
                          &o_proj_beta,
@@ -1426,8 +1500,10 @@ int main(int argc, char *argv[])
 
             residualAdd(hidden_state, o_proj, num_active_slots);
 
+            // ---- G.3.9 post-attn rmsNorm ----
             rmsNorm(hidden_state, rms_norms, weights.post_attn_layernorms[layer], num_active_slots);
 
+            // ---- G.3.10 FFN: gate / up / silu / down ----
             // MLP
             cublasGemmEx(cublas_handle,
                          CUBLAS_OP_T,
@@ -1470,8 +1546,10 @@ int main(int argc, char *argv[])
                          CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT);
 
+            // SiLU(gate) ⊙ up，结果 in-place 写回 gate
             silu(gate, up, num_active_slots);
 
+            // down 投影
             down = buf_2048_2;
             cublasGemmEx(cublas_handle,
                          CUBLAS_OP_T,
@@ -1493,31 +1571,38 @@ int main(int argc, char *argv[])
                          CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT);
 
+            // ---- G.3.11 FFN residualAdd → 进入下一层 ----
             residualAdd(hidden_state, down, num_active_slots);
         }
 
+        // ---- Stage G.4: Final rmsNorm + LM head ----
+        // 与 prefill stage 3-4 同模式，但 num_active_slots 替代 prompt_len
         rmsNorm(hidden_state, rms_norms, weights.norm, num_active_slots);
 
         cublasGemmEx(cublas_handle,
                      CUBLAS_OP_T,
                      CUBLAS_OP_N,
-                     VOCAB_SIZE,       // m
+                     VOCAB_SIZE,       // m = 128256
                      num_active_slots, // n
                      EMBEDDING_LENGTH, // k
                      &embed_alpha,
-                     weights.embed_tokens,
+                     weights.embed_tokens, // weight tying
                      CUDA_R_16BF,
                      EMBEDDING_LENGTH,
                      rms_norms,
                      CUDA_R_16BF,
                      EMBEDDING_LENGTH,
                      &embed_beta,
-                     embed_proj,
+                     embed_proj,        // 输出 [num_active_slots, 128256] = logits
                      CUDA_R_16BF,
                      VOCAB_SIZE,
                      CUBLAS_COMPUTE_32F,
                      CUBLAS_GEMM_DEFAULT);
 
+        // ---- Stage G.5: Argmax per slot + EOS 检测 + 物理块回收 ----
+        // 拷整个 [num_active_slots, 128256] logits 回 CPU
+        // num_active_slots 通常 ≤ 2，所以只是 256KB × 2 = 512KB，比 prefill 的
+        // [prompt_len, 128256] 小很多
         cudaMemcpy(embed_proj_cpu.data(), embed_proj, sizeof(__nv_bfloat16) * num_active_slots * VOCAB_SIZE, cudaMemcpyDeviceToHost);
 
         float max_token = 0.0;
@@ -1525,6 +1610,7 @@ int main(int argc, char *argv[])
         for (int slot = 0; slot < num_active_slots; ++slot)
         {
             int active_slot = active_slots[slot];
+            // per-slot argmax
             max_token = (float)embed_proj_cpu[slot * VOCAB_SIZE]; // TODO: verify if float is good enough in place of nvbf16
             max_token_idx = 0;
             for (int token_idx = 0; token_idx < VOCAB_SIZE; ++token_idx)
@@ -1537,8 +1623,19 @@ int main(int argc, char *argv[])
             }
             // TODO: wrap with #ifdef DEBUG
             std::cout << "Output token: " << (float)max_token << ", token index: " << std::to_string(max_token_idx) << std::endl;
+            // ---- EOS 检测：3 个终止条件 ----
+            //   1) END_OF_TEXT_TOKEN_ID = 128001（<|end_of_text|>）
+            //   2) EOT_ID_TOKEN_ID = 128009（<|eot_id|>，instruct 模型对话结束）
+            //   3) 达到 MAX_SEQ_LEN-1（KV cache 满了）
             if (max_token_idx == END_OF_TEXT_TOKEN_ID || max_token_idx == EOT_ID_TOKEN_ID || current_prompt_len[active_slot] == MAX_SEQ_LEN - 1)
             {
+                // ---- 释放该 slot 占用的所有物理块 ----
+                // 这是 continuous batching 的关键：一个 sequence 完成后立即把它的
+                // 资源还回去，不需要等整个 batch 结束
+                //
+                // 双重 for loop：N_LAYERS × MAX_BLOCKS_PER_SEQ = 16 × 128 = 2048 次扫描
+                // 每个 block_table entry：如果非 -1（已分配），把物理块还回 free_blocks，
+                // 并把 entry 重置为 -1（让下次复用此 slot 的新 sequence 能重新分配）
                 is_slot_free[active_slot] = true;
                 for (int layer = 0; layer < N_LAYERS; ++layer)
                 {
@@ -1552,18 +1649,98 @@ int main(int argc, char *argv[])
                         }
                     }
                 }
+                // 同步重置后的 block_table 到 GPU（虽然该 slot 不再 active，但下次同 slot
+                // 复用时如果不重置 GPU 端可能读到脏数据）
                 cudaMemcpy(block_table_gpu, block_table.data(), MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int), cudaMemcpyHostToDevice);
             }
             else
             {
+                // 没有 EOS：把生成的 token 记录下来，供下一轮 decode 使用
+                // current_prompt_len + 1：本轮新 token 已写 KV cache，下轮 seq_len 多 1
                 last_generated_tokens[active_slot] = max_token_idx;
                 generated_tokens[active_slot].push_back(max_token_idx);
                 current_prompt_len[active_slot] = current_prompt_len[active_slot] + 1;
             }
         }
     }
+    // ---- Stage G.6: 退出 ----
+    // 跳出 while(true) 的唯一路径：active_slots == 0 且 queue empty
+    //   = 所有 prompt 都跑完，没人在生成
+    // 真正的 inference server 这里应该是无限等新连接进来，break 是教学版的简化
     std::cout << "\nOk bye!\n";
     cublasDestroy(cublas_handle);
+    // 等所有 GPU 操作完成（cudaMemcpyAsync / kernel launch 是异步的）
     cudaDeviceSynchronize();
+
+    // =========================================================================
+    // Decode 反问答案（对应 G.3 顶部 [QD1]-[QD5]）
+    // -------------------------------------------------------------------------
+    // [AD1] decode 的 GEMM 比 prefill 慢得多，单位是 throughput per token：
+    //         - prefill：N=512 时 GEMM 是方阵 [512, 2048] × [2048, 2048]，
+    //           cublas 能用 Tensor Core 满载，~95% peak FLOPS
+    //         - decode：num_active_slots=2 时 GEMM 是窄矩阵 [2, 2048] × [2048, 2048]，
+    //           输出只有 2×2048 个元素，无法填满 SM warp 调度，~10-30% peak FLOPS
+    //       数学上每个 token 的算力需求一样（都是 weight × input），但 Tensor Core
+    //       一次最少处理 8×8 / 16×16 块矩阵，2 行根本填不满。
+    //       这就是 decode 是 memory-bound 的根因——访存量（读 weight 矩阵）固定，
+    //       计算"摊薄"到很少 token 上，arithmetic intensity 低。
+    //       优化：增大 batch size（vLLM 默认 max_num_seqs=256，让每 GEMM 的 m 维度
+    //       到 256+，接近方阵）。这就是 continuous batching 提升 throughput 的根本。
+    //
+    // [AD2] pagedAttention 是 attention 步骤的 fused kernel，处理整个
+    //       Q × K^T → softmax → ×V 流水：
+    //         - prefill 用 cublas 4 步：因为 N×N attention scores 矩阵规模大
+    //           （N=512 → 256K 元素），用 cublas + 独立 softmax kernel 性能 OK
+    //         - decode 用 pagedAttention：因为每 slot 只算一行 [1, seq_len]，
+    //           cublas 4 步的 launch 开销主导，融合 kernel 性能远优
+    //       prefill 也能用 fused kernel——这就是 FlashAttention（Tri Dao 2022）。
+    //       prefill 长 prompt 时 N×N scores 写 GMEM 是真正瓶颈，FA 把这步消除（不
+    //       存完整 scores，online softmax 边算边累），prefill 性能能涨 2-3×。
+    //       Tiny-vLLM 没用 FA 是因为：
+    //         a) 教学版优先简单代码，cublas 4 步直观
+    //         b) FA 实现复杂（block tiling + warp specialization）
+    //       生产 vLLM/SGLang prefill 都用 FA-2 或 FlashInfer。
+    //
+    // [AD3] block_table 每 layer 同步开销：
+    //         - 16KB × 16 layer = 256KB / decode step
+    //         - PCIe 4.0 x16 单向 ~32 GB/s → 256KB ≈ 8 µs
+    //         - decode step 总耗时 1B 模型在 5090 上 ~10-20 ms / token
+    //         - 256KB 同步占 0.04-0.08% 时间，看似不大
+    //       但 cudaMemcpy 是同步的（阻塞 CPU），实际开销是"CPU 等 GPU 完成上一步 +
+    //       PCIe 传输 + GPU 等下一步开始"的串行。如果用 cudaMemcpyAsync + 不同
+    //       stream，可以与 kernel 计算重叠。
+    //       更好的优化：
+    //         a) 整个 decode step 只同步一次（合并 16 layer 的更新，layer 内修改
+    //            block_table 但不同步）。但 G.3.5 修改和 G.3.7 读发生在同一 layer，
+    //            必须同步。除非把 G.3.5 推迟到 layer 末尾或所有 layer 后？
+    //         b) block_table 直接放 unified memory（host pinned），CPU 修改 GPU 立即看见
+    //         c) 把分配协议搬到 GPU（block_table 操作变成 GPU kernel，free_blocks 用
+    //            atomic counter）—— vLLM BlockManager 的方向
+    //
+    // [AD4] ropeDecode per-slot launch 不批量的原因：
+    //         - 各 slot 的 position_in_sequence（current_prompt_len）不同
+    //         - 现有 ropeKernelDecode 接受单个 position 标量参数
+    //         - 批量需要：position 数组 + kernel 内 blockIdx.x = slot 索引读 position[blockIdx.x]
+    //       开销估算：每 slot 2 次 kernel launch（Q + K），launch ~1 µs/次
+    //         num_active_slots=2 → 4 launches × 1 µs = 4 µs / layer
+    //         16 layer × 4 µs = 64 µs / decode step
+    //       与 [AD3] 同量级，加起来约 1% step 时间，不致命但浪费。
+    //       优化：写一个 ropeKernelDecodeBatched（接受 position 数组），1 次 launch
+    //       处理所有 slot 的 Q + K，能把 64 µs 砍到 ~2 µs。
+    //
+    // [AD5] EOS 检测在 GPU 做的好处和成本：
+    //         - 好处：避免 cudaMemcpy logits 回 CPU（256KB × 2 slot = 512KB / step），
+    //           节省 ~16 µs PCIe 同步等待
+    //         - 成本：需要 GPU argmax kernel + 比较 EOS token id + 把结果（int32）传回
+    //           CPU 决定 slot 状态
+    //       生产实现做法：argmax + sampling（top-k/top-p）一起放 GPU kernel，输出每
+    //       slot 一个 token id（4 bytes），传回 CPU 决定调度。
+    //       Tiny-vLLM 没做：
+    //         a) CPU 上写 argmax + EOS 简单几行代码，立即可用
+    //         b) GPU argmax 需要写 reduction kernel（处理 128256 维的 max）
+    //         c) sampling 还需要 RNG，比 argmax 复杂
+    //       Lab 7 Step 7 之后可以加一个 GPU argmax kernel 作为练习项。
+    // =========================================================================
+
     return 0;
 }
