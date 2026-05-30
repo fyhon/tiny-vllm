@@ -391,25 +391,109 @@ int loadWeights(Weights &weights)
     return 0;
 }
 
+// =============================================================================
+// prefill — 处理一个 prompt，跑完整 16 层 transformer，生成第一个 token
+// -----------------------------------------------------------------------------
+// 这是 LLM 推理的"预填充"阶段：把整个 prompt 的所有 token 一次性送进模型。
+// 与 decode 的本质差异：
+//   prefill：N 个 token 并行，可以打满 GPU 算力（compute-bound）
+//   decode：每次只生成 1 个 token，受 KV cache 加载带宽限制（memory-bound）
+//
+// ----- 完整数据流 -----
+//   prompt (N tokens)
+//     │
+//     ▼ embeddingGather
+//   hidden_state [N, 2048]
+//     │
+//     ├─── for layer 0..15: ─────────────────────────────────────────────┐
+//     │   rmsNorm                                                          │
+//     │   Q, K, V 投影 (cublas)            ← Q [N,2048]  K/V [N,512]      │
+//     │   RoPE on Q and K                                                  │
+//     │   把 K, V 写入 PagedAttention 物理块（per-layer per-slot）         │
+//     │   per-head loop × 32:                                              │
+//     │     attention_scores[h] = Q_h × K_h^T (cublas)  ← [N,N]            │
+//     │   causalMask + softmax                                             │
+//     │   per-head loop × 32:                                              │
+//     │     attn_v[h] = scores[h] × V_h (cublas)        ← [N,64]           │
+//     │   O_proj (cublas) + residualAdd                                    │
+//     │   rmsNorm (post-attn)                                              │
+//     │   gate, up 投影 (cublas)            ← [N,8192]                     │
+//     │   silu(gate) ⊙ up                                                 │
+//     │   down 投影 (cublas) + residualAdd                                 │
+//     │                                                                    │
+//     ▼ ────────────────────────────────────────────────────────────────┘
+//   final rmsNorm
+//     │
+//     ▼ cublas (× embed_tokens^T)
+//   logits [N, 128256]
+//     │
+//     ▼ argmax on last token only
+//   max_token_idx → generated_tokens[slot]
+//     │
+//     ▼
+//   sync block_table to GPU（让后续 decode 能用）
+//
+// ----- 巨型参数列表的来源 -----
+// 这个函数有 50+ 个参数，是因为：
+//   1) 没用 OOP（Engine class）封装上下文，所有 GPU buffer 都从 main() 传入
+//   2) 引用传递让 prefill 能修改 buffer 指针（如 q_proj、o_proj 等会被指到不同 buf）
+//   3) cublas alpha/beta 标量也按引用传，避免每次 cublasGemmEx 都构造临时变量
+// 作者自己也吐槽（见函数声明上方 TODO 注释）。生产实现会封装 Engine class，
+// 在 ctor 里分配并持有所有 buffer。
+//
+// ----- cublas 列主序 trick（重要：贯穿整个函数）-----
+// PyTorch / 我们的代码：行主序（row-major），矩阵 A[m,n] 内存布局是 m 行 × n 列连续
+// cuBLAS：列主序（column-major），它把同一片内存解读为 n 行 × m 列
+// 数学等价：cublas 看到的 = 我们矩阵的转置
+//
+// trick：要算 C = A × B（A,B,C 都是行主序）
+//   等价于  C^T = B^T × A^T  （转置律）
+//   cublas 看到的 A,B,C 已经是 A^T, B^T, C^T，所以直接调用 cublas(B, A) → 输出
+//   这块内存 cublas 看作 C^T，我们读作 C，无需显式 transpose
+// 这就是为什么下面所有 cublasGemmEx 都把 weight 当第一参数（CUBLAS_OP_T）、
+// activation 当第二参数（CUBLAS_OP_N）—— activation 已经"被 cublas 看作转置"。
+//
+// ----- 学习反问（答案在函数末尾 [AP1]-[AP5] 区块）-----
+//   [QP1] 为什么 attention 算 32 个 head 用 for loop 而不是 batched gemm？
+//   [QP2] 为什么 q_proj 指向 buf_2048_1，o_proj 指向 buf_2048_2？为什么要两个 buffer？
+//   [QP3] argmax 在 CPU 上做（cudaMemcpy 整个 logits 回 CPU）有多大代价？
+//   [QP4] block_table 末尾整体 cudaMemcpy 同步到 GPU，效率低在哪？
+//   [QP5] 这个 prefill 实现什么时候会是 memory-bound、什么时候 compute-bound？
+// =============================================================================
 // TODO: clean up this mess lol XD (I mean, the arguments list is so long, but maybe that's unavoidable, I don't know yet)
 void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int &prompt_len, std::vector<bool> &is_slot_free, int slot, int *gpu_input_tokens, nv_bfloat16 *input_embeddings, Weights &weights, nv_bfloat16 *hidden_state, nv_bfloat16 *rms_norms, nv_bfloat16 *&q_proj, nv_bfloat16 *buf_2048_1, cublasHandle_t cublas_handle, float &q_proj_alpha, float &q_proj_beta, float &k_proj_alpha, float &k_proj_beta, float &v_proj_alpha, float &v_proj_beta, nv_bfloat16 *prefill_attn_scores, float &attn_alpha, float &attn_beta, nv_bfloat16 *&attn_scores_v, float &attn_scores_v_alpha, float &attn_scores_v_beta, nv_bfloat16 *&o_proj, nv_bfloat16 *buf_2048_2, float &o_proj_alpha, float &o_proj_beta, float &gate_alpha, float &gate_beta, nv_bfloat16 *gate, float &up_alpha, float &up_beta, nv_bfloat16 *up, nv_bfloat16 *&down, float &down_alpha, float &down_beta, float &embed_alpha, float &embed_beta, nv_bfloat16 *embed_proj, std::vector<nv_bfloat16> &embed_proj_cpu, std::vector<std::vector<int>> &generated_tokens, std::vector<int> &last_generated_tokens, std::vector<int> &current_prompt_len, __nv_bfloat16 *k_proj_temp_buf, __nv_bfloat16 *v_proj_temp_buf, std::vector<int> &block_table, int *block_table_gpu, std::vector<int> &free_blocks, __nv_bfloat16 *kv_cache)
 {
+    // ---- Stage 1: 从队列取 prompt → 上传 token id 到 GPU → embedding lookup ----
     prompt = queue.front();
     prompt_len = prompt.size();
     queue.pop();
-    is_slot_free[slot] = false;
+    is_slot_free[slot] = false;  // 标记这个 slot 已被占用
 
+    // prompt token ids（CPU vector）→ GPU int 数组
     cudaMemcpy(gpu_input_tokens, prompt.data(), prompt_len * sizeof(int), cudaMemcpyHostToDevice);
+    // tokens [N] → embeddings [N, 2048]
     embeddingGather(gpu_input_tokens, input_embeddings, weights.embed_tokens, prompt_len);
 
+    // 复制 input_embeddings → hidden_state，因为：
+    //   - 后续 rmsNorm 是 hidden_state → rms_norms 的"读 hidden 写 norm"，不会破坏 hidden_state
+    //   - residualAdd 需要 hidden_state（保留原值）+ attn_output → 新 hidden_state
+    //   - 如果只用一份 buffer，rmsNorm 之后原始 embedding 就没了，residual 用不上
     cudaMemcpy(hidden_state,
                input_embeddings,
                prompt_len * EMBEDDING_LENGTH * sizeof(__nv_bfloat16),
                cudaMemcpyDeviceToDevice);
+    // ---- Stage 2: 16 层 transformer 主循环 ----
     for (int layer = 0; layer < N_LAYERS; ++layer)
     {
+        // ---- 2.1 input rmsNorm: hidden_state → rms_norms ----
+        // 注意：保留 hidden_state 不动，rmsNorm 输出到独立的 rms_norms buffer
         rmsNorm(hidden_state, rms_norms, weights.input_layernorm[layer], prompt_len);
 
+        // ---- 2.2 Q / K / V 投影 ----
+        // 数学：Q = rms_norms × W_q^T，dim = (N, 2048) × (2048, 2048) → (N, 2048)
+        //       K = rms_norms × W_k^T，dim = (N, 2048) × (2048, 512)  → (N, 512)
+        //       V = rms_norms × W_v^T，dim = (N, 2048) × (2048, 512)  → (N, 512)
+        // GQA：K/V dim 是 Q 的 1/4（512 = 8 KV heads × 64，Q 是 32 heads × 64）
         // Q = inputs * wq^T; my matrices are row-major, cublas expects column-major
         // it perceives my matrices as transposed
         // there's a trick where C = A * B == C^T = B^T * A^T
@@ -419,50 +503,52 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
         // because cublas sees the output as column-major
         // so it's in fact transposed
         // final dim (num_tok, EMBEDDING_LENGTH)
-        q_proj = buf_2048_1;
+        q_proj = buf_2048_1;  // 复用 buf_2048_1 作为 Q 投影输出
         cublasStatus_t q_proj_status = cublasGemmEx(cublas_handle,
-                                                    CUBLAS_OP_T,
-                                                    CUBLAS_OP_N,
-                                                    EMBEDDING_LENGTH,
-                                                    prompt_len,
-                                                    EMBEDDING_LENGTH,
-                                                    &q_proj_alpha,
-                                                    weights.w_q[layer],
+                                                    CUBLAS_OP_T,           // weight 转置（与列主序解读一起做了"两次转置 = 不转置"）
+                                                    CUBLAS_OP_N,           // activation 不转置（cublas 看到的就是我们的转置）
+                                                    EMBEDDING_LENGTH,      // m = 输出 col 数（行主序看的话就是行数）= 2048
+                                                    prompt_len,            // n = 输出 row 数 = N
+                                                    EMBEDDING_LENGTH,      // k = 共享维度 = 2048
+                                                    &q_proj_alpha,         // = 1.0
+                                                    weights.w_q[layer],    // [2048, 2048] bf16
                                                     CUDA_R_16BF,
-                                                    EMBEDDING_LENGTH,
-                                                    rms_norms,
+                                                    EMBEDDING_LENGTH,      // lda
+                                                    rms_norms,             // [N, 2048]
                                                     CUDA_R_16BF,
-                                                    EMBEDDING_LENGTH,
-                                                    &q_proj_beta,
-                                                    q_proj,
+                                                    EMBEDDING_LENGTH,      // ldb
+                                                    &q_proj_beta,          // = 0.0
+                                                    q_proj,                // 输出 [N, 2048]
                                                     CUDA_R_16BF,
-                                                    EMBEDDING_LENGTH,
-                                                    CUBLAS_COMPUTE_32F,
+                                                    EMBEDDING_LENGTH,      // ldc
+                                                    CUBLAS_COMPUTE_32F,    // 用 fp32 累加（避免 bf16 累加精度损失）
                                                     CUBLAS_GEMM_DEFAULT);
 
+        // K 投影：与 Q 同模式，但输出维度变 KV_DIM=512（GQA 4×↓）
         // input = (num_tokens, EMBEDDING_LENGTH), weights = (KV_DIM, EMBEDDING_LENGTH)
         // after trick: (KV_DIM, EMBEDDING_LENGTH) * (EMBEDDING_LENGTH, num_tokens) -> (KV_DIM, num_tokens), which really is (num_tok, KV_DIM)
         // lda: EMBEDDING_LENGTH, ldb: EMBEDDING_LENGTH, ldc: KV_DIM
         cublasStatus_t k_proj_status = cublasGemmEx(cublas_handle,
                                                     CUBLAS_OP_T,
                                                     CUBLAS_OP_N,
-                                                    KV_DIM,
+                                                    KV_DIM,                // 输出 col = 512
                                                     prompt_len,
                                                     EMBEDDING_LENGTH,
                                                     &k_proj_alpha,
-                                                    weights.w_k[layer],
+                                                    weights.w_k[layer],    // [512, 2048] bf16
                                                     CUDA_R_16BF,
                                                     EMBEDDING_LENGTH,
                                                     rms_norms,
                                                     CUDA_R_16BF,
                                                     EMBEDDING_LENGTH,
                                                     &k_proj_beta,
-                                                    k_proj_temp_buf,
+                                                    k_proj_temp_buf,       // K 临时 buffer [N, 512]，待 RoPE 后写 KV cache
                                                     CUDA_R_16BF,
                                                     KV_DIM,
                                                     CUBLAS_COMPUTE_32F,
                                                     CUBLAS_GEMM_DEFAULT);
 
+        // V 投影：与 K 同模式
         // same as K projection
         cublasStatus_t v_proj_status = cublasGemmEx(cublas_handle,
                                                     CUBLAS_OP_T,
@@ -478,28 +564,44 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
                                                     CUDA_R_16BF,
                                                     EMBEDDING_LENGTH,
                                                     &v_proj_beta,
-                                                    v_proj_temp_buf,
+                                                    v_proj_temp_buf,       // V 临时 buffer [N, 512]，待写 KV cache
                                                     CUDA_R_16BF,
                                                     KV_DIM,
                                                     CUBLAS_COMPUTE_32F,
                                                     CUBLAS_GEMM_DEFAULT);
 
+        // ---- 2.3 RoPE on Q and K（V 不需要 RoPE，见 kernels.cu ropeKernel 反问 [A1]）----
         // RoPE now
 
-        rope(q_proj, prompt_len, EMBEDDING_LENGTH);
-        rope(k_proj_temp_buf, prompt_len, KV_DIM);
+        rope(q_proj, prompt_len, EMBEDDING_LENGTH);          // Q：proj_dim=2048，每 token 32 个 head 各做旋转
+        rope(k_proj_temp_buf, prompt_len, KV_DIM);            // K：proj_dim=512，每 token 8 个 head 各做旋转
 
+        // ---- 2.4 把 K, V 写入 PagedAttention 物理块 ----
         // PagedAttention - scatter K and V into blocks
         // slot - index within batch
         // layer - index of layer
         // ceil(prompt_len/BLOCK_SIZE) = number of blocks needed to allocate in block table
+        //
+        // 这里是 prefill 与 decode 分歧的"关键写入点"：
+        //   prefill 把 [N, 512] 的 K/V 按 BLOCK_SIZE=16 切片，每片占用一个物理块
+        //   decode 时 pagedAttention kernel 内部按 block_table 索引读这些物理块
+        //
+        // 物理块布局（per block，BLOCK_BYTES=32KB）：
+        //   [K: BLOCK_SIZE × KV_DIM × bf16 = 16 × 512 × 2 = 16KB][V: 同上]
+        //
+        // block_table 三维：[slot, layer, logical_block_idx] → physical_block_id
         for (int token_idx = 0; token_idx < prompt_len; token_idx += BLOCK_SIZE)
         {
+            // 这个 block 实际写入的 token 数（最后一块可能不满 16）
             int num_tokens_to_copy = prompt_len - token_idx;
             if (num_tokens_to_copy > BLOCK_SIZE)
             {
                 num_tokens_to_copy = BLOCK_SIZE;
             }
+            // ---- 物理块分配协议 ----
+            // 1) 看 block_table[slot][layer][logical_block_idx] 是不是 -1（未分配）
+            // 2) 是 -1 → 从 free_blocks 栈顶取一个物理块编号，写回 block_table
+            // 3) 不是 -1 → 此块已分配（prefill 不该出现这种情况，否则 assert）
             // read index of physical block from logical block_table
             // if -1, then need to allocate the new block
             // pop from free_blocks
@@ -510,6 +612,8 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
             int block = block_table[slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + block_idx];
             if (block == -1)
             {
+                // free_blocks 是 LIFO 栈（vector + back/pop_back）
+                // 设计上没有"按访问局部性优化"，物理块是随机散布在 KV cache 大池子里
                 int physical_block_idx = free_blocks.back();
                 free_blocks.pop_back();
                 block = physical_block_idx;
@@ -517,21 +621,32 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
             }
             else
             {
+                // prefill 阶段 block 不可能是已分配状态：每个 prompt 都是新进来的
+                // 这个 assert 是防御性编程，理论上不会触发
                 assert(false && "block must be -1 during prefill - what happened?");
                 // probably in prefill this doesn't make a lot of sense? but will matter in decode
             }
 
+            // ---- 把 K 写入物理块的 K 部分 ----
             // store K
             __nv_bfloat16 *k_cache_ptr = (__nv_bfloat16 *)((char *)kv_cache + block * BLOCK_BYTES);
             __nv_bfloat16 *k_proj_ptr = k_proj_temp_buf + token_idx * KV_DIM;
             cudaMemcpy(k_cache_ptr, k_proj_ptr, num_tokens_to_copy * KV_DIM * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
 
+            // ---- 把 V 写入物理块的 V 部分（V_OFFSET 之后）----
             // store V
             __nv_bfloat16 *v_cache_ptr = (__nv_bfloat16 *)((char *)kv_cache + block * BLOCK_BYTES + V_OFFSET);
             __nv_bfloat16 *v_proj_ptr = v_proj_temp_buf + token_idx * KV_DIM;
             cudaMemcpy(v_cache_ptr, v_proj_ptr, num_tokens_to_copy * KV_DIM * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
         }
 
+        // ---- 2.5 Attention scores: per-head QK^T 计算 ----
+        // 数学：score_h = Q_h × K_h^T / sqrt(64)，dim (N, 64) × (64, N) = (N, N)
+        // 全部 32 个 head 输出形状 (32, N, N)
+        //
+        // ⚠️ 这里用 for loop 顺序调用 32 次 cublasGemmEx，每次小 GEMM
+        // 反问 [QP1] 答案：用 cublasGemmStridedBatchedEx 一次 launch 处理 32 head
+        // 性能更好，但教学版用 loop 让每个 head 的内存计算清晰可见
         // attention scores
         // per head, 64 elements each
         // so total 32 heads
@@ -545,36 +660,54 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
         // total output (32, num_tok, num_tok)
         for (int i = 0; i < NUM_Q_HEADS; ++i)
         {
+            // GQA：4 个 Q head 共享 1 个 K head（i=0,1,2,3 → k_head=0；i=4,5,6,7 → k_head=1...）
             int k_head_idx = i / GQA_Q_TO_K_RATIO;
+            // Q_head 在 q_proj 中的偏移：每个 head 64 维，依次排列
+            // q_proj 形状 [N, 2048] = [N, 32 heads × 64]，head i 起点 = i * 64
             __nv_bfloat16 *q_head = q_proj + i * HEAD_DIM;
             __nv_bfloat16 *k_head = k_proj_temp_buf + k_head_idx * HEAD_DIM;
+            // attn_scores 形状 [32, N, N]，head i 的 [N,N] 子矩阵起点
             __nv_bfloat16 *attn_score_head = prefill_attn_scores + prompt_len * prompt_len * i;
 
+            // 注意 lda/ldb：q_head/k_head 在大 buffer 里，stride 不是 HEAD_DIM 而是
+            //   q_proj 的 stride = EMBEDDING_LENGTH = 2048 (32 head 拼接)
+            //   k_proj_temp_buf 的 stride = KV_DIM = 512 (8 head 拼接)
+            // attn_alpha = 1/sqrt(64) = 0.125（在 main 里设置），cublas 直接乘进去
             cublasStatus_t attn_score_status = cublasGemmEx(cublas_handle,
                                                             CUBLAS_OP_T,
                                                             CUBLAS_OP_N,
-                                                            prompt_len,
-                                                            prompt_len,
-                                                            HEAD_DIM,
-                                                            &attn_alpha,
+                                                            prompt_len,         // m = N (输出行)
+                                                            prompt_len,         // n = N (输出列)
+                                                            HEAD_DIM,           // k = 64 (HEAD_DIM)
+                                                            &attn_alpha,        // = 1/sqrt(64) ≈ 0.125
                                                             k_head,
                                                             CUDA_R_16BF,
-                                                            KV_DIM,
+                                                            KV_DIM,             // lda = K 大 buffer 的 stride
                                                             q_head,
                                                             CUDA_R_16BF,
-                                                            EMBEDDING_LENGTH,
-                                                            &attn_beta,
+                                                            EMBEDDING_LENGTH,   // ldb = Q 大 buffer 的 stride
+                                                            &attn_beta,         // = 0
                                                             attn_score_head,
                                                             CUDA_R_16BF,
-                                                            prompt_len,
+                                                            prompt_len,         // ldc = 输出 stride
                                                             CUBLAS_COMPUTE_32F,
                                                             CUBLAS_GEMM_DEFAULT);
         }
 
+        // ---- 2.6 Causal mask + softmax ----
+        // 对 [32, N, N] 的 scores 矩阵做：
+        //   1) causalMask：上三角置 -inf（每个 query 只能 attend 到自己和之前 token）
+        //   2) softmax：每行归一化为概率分布
+        // 详见 kernels.cu causalMaskKernel / softmaxKernel
         causalMask(prefill_attn_scores, prompt_len);
 
         softmax(prefill_attn_scores, prompt_len);
 
+        // ---- 2.7 attn_scores × V：per-head 加权累加 ----
+        // 数学：output_h = scores_h × V_h，dim (N, N) × (N, 64) = (N, 64)
+        // 全部 32 个 head 拼成 (N, 32 × 64) = (N, 2048)，作为 O 投影的输入
+        //
+        // GQA：4 个 Q head（也就是 4 个 attn_scores head）共享 1 个 V head
         // attn scores * V
         // (32, num_tok, num_tok) * (num_tok, 512)
         // GQA - 4 Q heads share 1 V head
@@ -585,7 +718,7 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
         // V_head dim (num_tok, 64)
         // output head dim: scores head * V head -> (num_tok, num_tok) * (num_tok, 64) = (num_tok, 64)
         // in total 32 output heads: so (num_tok, 64 * 32) = (num_tok, 2048)
-        attn_scores_v = buf_2048_1;
+        attn_scores_v = buf_2048_1;  // 复用 buf_2048_1（之前装 q_proj，现在装 attn_v 输出，前者用完了）
         for (int i = 0; i < NUM_Q_HEADS; ++i)
         {
             int v_head_idx = i / GQA_ATTN_SCORES_TO_V_RATIO;
@@ -595,31 +728,34 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
             __nv_bfloat16 *output_attn_scores_head = attn_scores_v + i * HEAD_DIM;
 
             cublasStatus_t attn_score_status = cublasGemmEx(cublas_handle,
+                                                            CUBLAS_OP_N,            // 注意：这里 V 不转置（与上面 K 转置不同）
                                                             CUBLAS_OP_N,
-                                                            CUBLAS_OP_N,
-                                                            HEAD_DIM,
-                                                            prompt_len,
-                                                            prompt_len,
+                                                            HEAD_DIM,               // m = 64
+                                                            prompt_len,             // n = N
+                                                            prompt_len,             // k = N (scores 矩阵的列数 = K row 数)
                                                             &attn_scores_v_alpha,
                                                             v_head,
                                                             CUDA_R_16BF,
-                                                            KV_DIM,
+                                                            KV_DIM,                 // lda = V 大 buffer stride
                                                             attn_scores_head,
                                                             CUDA_R_16BF,
                                                             prompt_len,
                                                             &attn_scores_v_beta,
                                                             output_attn_scores_head,
                                                             CUDA_R_16BF,
-                                                            EMBEDDING_LENGTH,
+                                                            EMBEDDING_LENGTH,       // ldc = 输出大 buffer stride（32 head 拼接）
                                                             CUBLAS_COMPUTE_32F,
                                                             CUBLAS_GEMM_DEFAULT);
         }
 
+        // ---- 2.8 O 投影：把 attention output 投回 hidden_size ----
+        // 数学：o_proj = attn_v × W_o^T，dim (N, 2048) × (2048, 2048) → (N, 2048)
+        // 与 Q 投影同模式
         // output projection, it will be an input for MLP blocks
         // attn_scores_v * w_o^T
         // (num_tok, 2048) * (2048, 2048) -> (num_tok, 2048)
         // same as Q projection, so copy paste
-        o_proj = buf_2048_2;
+        o_proj = buf_2048_2;  // 用 buf_2048_2 不复用 buf_2048_1，因为 attn_scores_v 还在用
         cublasStatus_t o_proj_status = cublasGemmEx(cublas_handle,
                                                     CUBLAS_OP_T,
                                                     CUBLAS_OP_N,
@@ -640,11 +776,23 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
                                                     CUBLAS_COMPUTE_32F,
                                                     CUBLAS_GEMM_DEFAULT);
 
+        // ---- 2.9 Residual + post-attn rmsNorm ----
+        // hidden_state = hidden_state + o_proj（attention residual）
+        // 注意 hidden_state 现在变成"attention 输出加 residual"，但还没经 FFN
         // (num_tok, 2048) + (num_tok, 2048) -> (num_tok, 2048)
         residualAdd(hidden_state, o_proj, prompt_len);
         // post attention RMS Norm
+        // 把 residual 后的 hidden 再 norm 一次，作为 FFN 输入
         rmsNorm(hidden_state, rms_norms, weights.post_attn_layernorms[layer], prompt_len);
 
+        // ---- 2.10 FFN: SwiGLU = SiLU(gate) ⊙ up，再过 down ----
+        // 三个 GEMM + 一个 elementwise kernel：
+        //   gate = rms_norms × W_gate^T  → (N, 8192)
+        //   up   = rms_norms × W_up^T    → (N, 8192)
+        //   gate = SiLU(gate) ⊙ up        in-place（kernels.cu siluKernel）
+        //   down = gate × W_down^T        → (N, 2048)
+        //
+        // FFN 比 attention 更占 FLOPs（3 个 8192×2048 GEMM vs attention 4 个 2048×2048）
         // SwiGLU time - just MLP + SiLU
         // gate = hidden_state (rms-normed) * mlp_gate_proj ^ T
         // HIDDEN_DIM = 8192
@@ -659,23 +807,24 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
         cublasStatus_t gate_status = cublasGemmEx(cublas_handle,
                                                   CUBLAS_OP_T,
                                                   CUBLAS_OP_N,
-                                                  HIDDEN_DIM,
+                                                  HIDDEN_DIM,                      // m = 8192 (输出维度)
                                                   prompt_len,
                                                   EMBEDDING_LENGTH,
                                                   &gate_alpha,
-                                                  weights.mlp_gate_proj[layer],
+                                                  weights.mlp_gate_proj[layer],    // [8192, 2048]
                                                   CUDA_R_16BF,
                                                   EMBEDDING_LENGTH,
                                                   rms_norms,
                                                   CUDA_R_16BF,
                                                   EMBEDDING_LENGTH,
                                                   &gate_beta,
-                                                  gate,
+                                                  gate,                            // 输出 [N, 8192]
                                                   CUDA_R_16BF,
                                                   HIDDEN_DIM,
                                                   CUBLAS_COMPUTE_32F,
                                                   CUBLAS_GEMM_DEFAULT);
 
+        // up 投影：与 gate 同模式，权重不同
         // up, the same dims as gate
         cublasStatus_t up_status = cublasGemmEx(cublas_handle,
                                                 CUBLAS_OP_T,
@@ -697,12 +846,16 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
                                                 CUBLAS_COMPUTE_32F,
                                                 CUBLAS_GEMM_DEFAULT);
 
+        // SiLU(gate) ⊙ up，结果 in-place 写回 gate
+        // 详见 kernels.cu siluKernel
         // SiLU
         // after_silu = SiLU(gate) * up (element-wise multication)
         // after_silu = gate * (1 / (1 + e^(-gate))) * up
         // gate is dim (num_tok, 8192), up too
         silu(gate, up, prompt_len); // gate = after_silu now
 
+        // ---- down 投影：把 8192 维投回 2048 hidden ----
+        // 数学：down = gate × W_down^T，dim (N, 8192) × (8192, 2048) → (N, 2048)
         // down projection
         // output = post-silu * down_proj^T
         // dims: (num_tok, 8192) * (2048, 8192) ^ T = (num_tok, 8192) * (8192, 2048) = (num_tok, 2048)
@@ -712,7 +865,7 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
         // dims = (2048, 8192) * (8192, num_tok) = (2048, num_tok)
         // m: 2048 n: num_tok, k: 8192
         // lda: 8192, ldb: 8192, ldc: 2048
-        down = buf_2048_2;
+        down = buf_2048_2;  // 复用 buf_2048_2（之前装 o_proj 已用完）
         cublasStatus_t down_status = cublasGemmEx(cublas_handle,
                                                   CUBLAS_OP_T,
                                                   CUBLAS_OP_N,
@@ -733,11 +886,17 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
                                                   CUBLAS_COMPUTE_32F,
                                                   CUBLAS_GEMM_DEFAULT);
 
+        // ---- 2.11 FFN residual + 进入下一层 ----
+        // hidden_state = hidden_state + down，至此一层 transformer 完成
         // (num_tok, 2048) + (num_tok, 2048) -> (num_tok, 2048)
         residualAdd(hidden_state, down, prompt_len);
     }
+    // ---- Stage 3: Final rmsNorm（所有 16 层结束后的最后归一化）----
     rmsNorm(hidden_state, rms_norms, weights.norm, prompt_len);
 
+    // ---- Stage 4: LM head: hidden → logits over vocab ----
+    // 数学：logits = rms_norms × embed_tokens^T，(N, 2048) × (2048, 128256) → (N, 128256)
+    // weight tying：复用 embedding 矩阵作为 LM head（Llama 没有独立的 lm_head weight）
     // logits = rms_norms * weights.embed_tokens^T
     // dim rms_norms: (num_tok, 2048), dim embed_tokens: (128256, 2048)
     // logits dim = (num_tok, 2048) * (2048, 128256) = (num_tok, 128256) => m = num_tok, n = 128256, k = 2048
@@ -754,28 +913,34 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
     cublasStatus_t embed_status = cublasGemmEx(cublas_handle,
                                                CUBLAS_OP_T,
                                                CUBLAS_OP_N,
-                                               VOCAB_SIZE,
+                                               VOCAB_SIZE,             // 128256（Llama 3 词表）
                                                prompt_len,
                                                EMBEDDING_LENGTH,
                                                &embed_alpha,
-                                               weights.embed_tokens,
+                                               weights.embed_tokens,   // weight tying：与 embedding 共享权重
                                                CUDA_R_16BF,
                                                EMBEDDING_LENGTH,
                                                rms_norms,
                                                CUDA_R_16BF,
                                                EMBEDDING_LENGTH,
                                                &embed_beta,
-                                               embed_proj,
+                                               embed_proj,             // 输出 [N, 128256] = logits
                                                CUDA_R_16BF,
                                                VOCAB_SIZE,
                                                CUBLAS_COMPUTE_32F,
                                                CUBLAS_GEMM_DEFAULT);
 
+    // ---- Stage 5: Argmax（CPU 上做，不优雅但简洁）----
+    // 拷整个 logits [N, 128256] 回 CPU 是浪费——其实只需要最后一个 token 的
+    // [128256] 那一行，因为只有最后 token 用来生成下一个。
+    // 这是一个明显的优化点（反问 [QP3] 答案）：
+    //   1) 只 cudaMemcpy 最后一个 token 的 128256 个 logits（256KB 而不是 N×256KB）
+    //   2) 或者 GPU 上写一个 argmax kernel，只回传 1 个 int
     cudaMemcpy(embed_proj_cpu.data(), embed_proj, sizeof(__nv_bfloat16) * prompt_len * VOCAB_SIZE, cudaMemcpyDeviceToHost);
     // argmax to get the output token
     // TODO: write a proper kernel for it
     // for now just a simple CPU function
-    int last_token_offset = (prompt_len - 1) * VOCAB_SIZE;
+    int last_token_offset = (prompt_len - 1) * VOCAB_SIZE;  // 只看最后一个 token 的 logits
     float max_token = (float)embed_proj_cpu[last_token_offset];
     int max_token_idx = 0;
     for (int token_idx = 0; token_idx < VOCAB_SIZE; ++token_idx)
@@ -788,13 +953,76 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
     }
     std::cout << "Output token: " << (float)max_token << ", token index: " << std::to_string(max_token_idx) << std::endl;
 
-    generated_tokens[slot].push_back(max_token_idx);
-    last_generated_tokens[slot] = max_token_idx;
-    current_prompt_len[slot] = prompt_len;
+    // ---- Stage 6: 把生成的 token 记录到 batch 状态 ----
+    generated_tokens[slot].push_back(max_token_idx);     // 该 slot 累计生成的 token list
+    last_generated_tokens[slot] = max_token_idx;          // decode 下一轮的 input
+    current_prompt_len[slot] = prompt_len;                // 该 slot 当前 KV cache 占用长度
 
+    // ---- Stage 7: block_table CPU → GPU 同步 ----
+    // 因为 prefill 的 block 分配是在 CPU vector block_table 上做的（用 free_blocks
+    // 栈分配），但 decode 时 pagedAttention kernel 读 GPU 上的 block_table_gpu。
+    // 所以 prefill 末尾必须把整张 block_table 同步到 GPU。
+    //
+    // ⚠️ 这里整张表都拷贝（MAX_SEQUENCES × N_LAYERS × MAX_BLOCKS_PER_SEQ × 4B
+    // = 2 × 16 × 128 × 4 = 16KB），即使只有这个 slot 的部分变了。
+    // 反问 [QP4] 答案：可以只拷该 slot 的子矩阵 N_LAYERS × MAX_BLOCKS_PER_SEQ
+    // = 16 × 128 × 4 = 8KB，省一半。但因为表本来就很小（< 64KB），优化不紧迫。
+    //
+    // 真正的瓶颈是这是个 host→device 同步拷贝，prefill 必须等它完成才能返回。
+    // 优化方向：在 GPU 上直接维护 block_table，free_blocks 也用 GPU lock-free 队列
     // synchronize state of block_table with block_table_gpu
     // TODO: do it more clever and not copy full table unnecessarily
     cudaMemcpy(block_table_gpu, block_table.data(), MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int), cudaMemcpyHostToDevice);
+
+    // =====================================================================
+    // 反问答案（对应函数顶部 [QP1]-[QP5]）
+    // ---------------------------------------------------------------------
+    // [AP1] for loop 32 次小 GEMM 是教学清晰但性能次优。优化层级：
+    //         a) cublasGemmStridedBatchedEx：一次 launch 处理 32 head，
+    //            cublas 内部自动 batch dispatch。GQA 需要 broadcast K/V（4 Q : 1 K），
+    //            可以用 stride=0 的技巧让 4 个 Q head 共用同一份 K head
+    //         b) 直接用 FlashAttention：Q×K^T + softmax + ×V 三步融成一个 kernel，
+    //            还省了 [N,N] scores 矩阵的 GMEM 写入和读出（这是 prefill 长 prompt 的
+    //            主要瓶颈）
+    //         c) FA-2 / xformers / TransformerEngine 都是这条路线
+    //
+    // [AP2] q_proj 和 o_proj 是 transformer 一层中"还需要保留的中间结果"：
+    //         - Q 算完后要做 RoPE（in-place）+ 喂给 attention scores
+    //         - O 算完后要 residualAdd（读 hidden + o_proj 算和）
+    //       attention scores 和 attn_v 用同一个 buf_2048_1 是因为 attn_v 阶段
+    //       Q 已经"消化"完了（K 已写 KV cache，scores 也算完）。
+    //       buffer 调度很微妙——这就是为什么生产 Engine 会把这些封装成 BufferPool。
+    //       Tiny-vLLM 用 2 个交替 buf 是最小化 GPU 显存占用的取舍。
+    //
+    // [AP3] 拷整个 [N, 128256] logits 回 CPU 在长 prompt 时浪费明显：
+    //         - prompt_len=512 时 logits = 512 × 128256 × 2B = 128MB 回拷
+    //         - 真正用的只有最后一行 128256 × 2B = 256KB
+    //       PCIe 4.0 x16 单向 32GB/s，128MB → 4ms 的延迟，不可忽略。
+    //       优化：
+    //         a) cudaMemcpy 时只拷 last_token_offset 起的 256KB
+    //         b) GPU 上写 argmax kernel（用 block reduce + atomicMax），只回传 int
+    //       生产实现一定走 (b)，因为还要支持 top-k/top-p 采样，不能离开 GPU。
+    //
+    // [AP4] 整张 block_table 同步拷贝两个低效点：
+    //         a) 即使只有一个 slot 改了，也拷整张（浪费 ~50% 带宽）
+    //         b) 同步拷贝阻塞 prefill 返回（cudaMemcpy 默认是同步的）
+    //       优化：
+    //         a) 只拷该 slot 的子表（[slot:slot+1] × N_LAYERS × MAX_BLOCKS_PER_SEQ）
+    //         b) 用 cudaMemcpyAsync + 后续 stream sync，让 CPU 早返回
+    //         c) 终极方案：block_table 直接维护在 GPU 上（用 unified memory 或 pinned host）
+    //       这里影响小是因为 block_table 就 16KB，不是瓶颈。但学习它的低效性
+    //       对理解"为什么生产 vLLM 用 GPU 上的 BlockManager"很重要。
+    //
+    // [AP5] prefill 的 compute/memory 平衡随 prompt_len 变化：
+    //       - 短 prompt（N < 32）：每次 GEMM 都是窄矩阵（如 [32, 2048] × [2048, 2048]），
+    //         arithmetic intensity 低，memory-bound（受 HBM 带宽限制）
+    //       - 中 prompt（N ≈ 128~512）：GEMM 形状接近"方阵"，cublas 能打满 Tensor Core，
+    //         compute-bound（受峰值 FLOPS 限制）
+    //       - 长 prompt（N > 1024）：QK^T 和 scores×V 的 [N, N] 矩阵尺寸爆炸，
+    //         GMEM 读写占主导，又变 memory-bound（这是 FlashAttention 解决的核心问题）
+    //       Lab 1 (prefill vs decode profiling) 量化过这种过渡点。
+    //       Roofline 分析（Lab 2 / wiki/track-b/phase-5/roofline-model.md）能精确定位。
+    // =====================================================================
 }
 
 int main(int argc, char *argv[])
