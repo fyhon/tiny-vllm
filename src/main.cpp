@@ -26,11 +26,62 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <queue>
+#include <chrono>   // B.1 step 2: model load + argmax CPU wall-clock
+#include <vector>   // B.1 step 2: per-prompt prefill / per-step decode timing arrays
 #define JSON_USE_IMPLICIT_CONVERSIONS 0
 #include "json.hpp"
 #include "kernels.cuh"
 
 using json = nlohmann::json;
+
+// =============================================================================
+// B.1 step 2: 中粒度计时基础设施
+// -----------------------------------------------------------------------------
+// 设计：用 cudaEvent 测 GPU 工作（prefill / decode），std::chrono 测 CPU 工作
+//      （model load / argmax）。所有数据收集到 ProfileData，main 末尾 summary。
+// 不走 #ifdef PROFILE，因为 cudaEvent 本身开销 < 1µs，不影响 sub-ms 测量精度。
+// =============================================================================
+struct ProfileData
+{
+    // CPU wall-clock（毫秒）
+    double model_load_ms = 0.0;
+    double total_wallclock_ms = 0.0;
+    double total_argmax_cpu_ms = 0.0; // 所有 argmax CPU 部分之和
+
+    // GPU events（毫秒，cudaEventElapsedTime 单位）
+    std::vector<double> prefill_ms;            // 每次 prefill 的 GPU 时间
+    std::vector<int> prefill_prompt_len;       // 对应的 prompt 长度
+    std::vector<double> decode_step_ms;        // 每轮 while 循环 decode 部分的 GPU 时间
+    std::vector<int> decode_step_active_slots; // 当时的 num_active_slots
+
+    int total_decode_tokens = 0;
+};
+
+// 简化版 cudaEvent timer：构造 record start，stop() 算 elapsed_ms
+struct CudaTimer
+{
+    cudaEvent_t start_event, stop_event;
+    CudaTimer()
+    {
+        cudaEventCreate(&start_event);
+        cudaEventCreate(&stop_event);
+        cudaEventRecord(start_event);
+    }
+    ~CudaTimer()
+    {
+        cudaEventDestroy(start_event);
+        cudaEventDestroy(stop_event);
+    }
+    // 返回 start 到 现在 的毫秒数（会同步等 GPU 完成）
+    double stop()
+    {
+        cudaEventRecord(stop_event);
+        cudaEventSynchronize(stop_event);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, start_event, stop_event);
+        return (double)ms;
+    }
+};
 
 // =============================================================================
 // 模型常量（Llama 3.2 1B-Instruct 硬编码）
@@ -933,6 +984,10 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
 // =============================================================================
 int main(int argc, char *argv[])
 {
+    // ---- B.1 step 2: 计时基础设施 ----
+    ProfileData prof;
+    auto wallclock_start = std::chrono::steady_clock::now();
+
     // ---- Stage A: cublas + Weights ----
     // cublas 是 GEMM 的工具，整个推理流程的所有矩阵乘都用它（Q/K/V proj、attn QK^T、
     // attn × V、O proj、gate/up/down、lm_head），自己写 kernel 性能比不过
@@ -945,9 +1000,15 @@ int main(int argc, char *argv[])
     }
 
     Weights weights{};
-    if (loadWeights(weights) != 0)
     {
-        return 1;
+        // 量化 model load：包含 SafeTensors 解析 + 1.7GB cudaMemcpy host→device
+        auto t0 = std::chrono::steady_clock::now();
+        if (loadWeights(weights) != 0)
+        {
+            return 1;
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        prof.model_load_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
 
     // ---- Stage B: KV cache 三件套 ----
@@ -1203,7 +1264,11 @@ int main(int argc, char *argv[])
         {
             continue; // slot taken, skip
         }
+        // B.1 step 2: 包 cudaEvent 测 prefill GPU 时间（含其内部 cudaMemcpy / kernels / cublas）
+        CudaTimer t_prefill;
         prefill(prompt, queue, prompt_len, is_slot_free, slot, gpu_input_tokens, input_embeddings, weights, hidden_state, rms_norms, q_proj, buf_2048_1, cublas_handle, q_proj_alpha, q_proj_beta, k_proj_alpha, k_proj_beta, v_proj_alpha, v_proj_beta, prefill_attn_scores, attn_alpha, attn_beta, attn_scores_v, attn_scores_v_alpha, attn_scores_v_beta, o_proj, buf_2048_2, o_proj_alpha, o_proj_beta, gate_alpha, gate_beta, gate, up_alpha, up_beta, up, down, down_alpha, down_beta, embed_alpha, embed_beta, embed_proj, embed_proj_cpu, generated_tokens, last_generated_tokens, current_prompt_len, k_proj_temp_buf, v_proj_temp_buf, block_table, block_table_gpu, free_blocks, kv_cache);
+        prof.prefill_ms.push_back(t_prefill.stop());
+        prof.prefill_prompt_len.push_back(prompt_len);
 
         // // after prefill:
         // int first_token = -1; // TODO just a stub
@@ -1247,7 +1312,11 @@ int main(int argc, char *argv[])
                     continue;
                 }
                 generated_tokens[slot].clear();  // 清空上次该 slot 生成的 token list
+                // B.1 step 2: 包 cudaEvent 测 prefill
+                CudaTimer t_prefill;
                 prefill(prompt, queue, prompt_len, is_slot_free, slot, gpu_input_tokens, input_embeddings, weights, hidden_state, rms_norms, q_proj, buf_2048_1, cublas_handle, q_proj_alpha, q_proj_beta, k_proj_alpha, k_proj_beta, v_proj_alpha, v_proj_beta, prefill_attn_scores, attn_alpha, attn_beta, attn_scores_v, attn_scores_v_alpha, attn_scores_v_beta, o_proj, buf_2048_2, o_proj_alpha, o_proj_beta, gate_alpha, gate_beta, gate, up_alpha, up_beta, up, down, down_alpha, down_beta, embed_alpha, embed_beta, embed_proj, embed_proj_cpu, generated_tokens, last_generated_tokens, current_prompt_len, k_proj_temp_buf, v_proj_temp_buf, block_table, block_table_gpu, free_blocks, kv_cache);
+                prof.prefill_ms.push_back(t_prefill.stop());
+                prof.prefill_prompt_len.push_back(prompt_len);
             }
             // 占用 slot（包括刚 prefill 完的）：加入 decode 名单
             active_slots.push_back(slot);
@@ -1271,6 +1340,9 @@ int main(int argc, char *argv[])
         // gpu_seq_lens [num_active_slots]      各 slot 当前 KV cache 长度（含 prefill prompt + 已生成）
         //                                       +1 是因为本轮的新 token 也算在 KV cache 里
         // copy useful data to gpu
+
+        // B.1 step 2: cudaEvent 测整个 decode step 的 GPU 时间（G.2 上传 → G.4 logits 回 CPU）
+        CudaTimer t_decode_step;
         cudaMemcpy(gpu_last_tokens, active_tokens.data(), num_active_slots * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(gpu_active_slots, active_slots.data(), num_active_slots * sizeof(int), cudaMemcpyHostToDevice);
         std::vector<int> seq_lens(num_active_slots);
@@ -1604,7 +1676,12 @@ int main(int argc, char *argv[])
         // num_active_slots 通常 ≤ 2，所以只是 256KB × 2 = 512KB，比 prefill 的
         // [prompt_len, 128256] 小很多
         cudaMemcpy(embed_proj_cpu.data(), embed_proj, sizeof(__nv_bfloat16) * num_active_slots * VOCAB_SIZE, cudaMemcpyDeviceToHost);
+        // B.1 step 2: 记录 decode step GPU 时间（cudaMemcpy 同步，已等 GPU 完成 LM head）
+        prof.decode_step_ms.push_back(t_decode_step.stop());
+        prof.decode_step_active_slots.push_back(num_active_slots);
 
+        // B.1 step 2: argmax CPU wall-clock（per-step 累加）
+        auto t_argmax_cpu_start = std::chrono::steady_clock::now();
         float max_token = 0.0;
         int max_token_idx = 0;
         for (int slot = 0; slot < num_active_slots; ++slot)
@@ -1660,8 +1737,14 @@ int main(int argc, char *argv[])
                 last_generated_tokens[active_slot] = max_token_idx;
                 generated_tokens[active_slot].push_back(max_token_idx);
                 current_prompt_len[active_slot] = current_prompt_len[active_slot] + 1;
+                // B.1 step 2: 累加 decode token 计数（仅 non-EOS 算入 throughput 分子）
+                prof.total_decode_tokens++;
             }
         }
+        // B.1 step 2: argmax CPU 部分耗时累加（含 EOS 处理路径里的 free_blocks 扫描和 block_table 同步——
+        // 这部分严格说不算 argmax，但 CPU 串行所以一起测）
+        auto t_argmax_cpu_end = std::chrono::steady_clock::now();
+        prof.total_argmax_cpu_ms += std::chrono::duration<double, std::milli>(t_argmax_cpu_end - t_argmax_cpu_start).count();
     }
     // ---- Stage G.6: 退出 ----
     // 跳出 while(true) 的唯一路径：active_slots == 0 且 queue empty
@@ -1741,6 +1824,87 @@ int main(int argc, char *argv[])
     //         c) sampling 还需要 RNG，比 argmax 复杂
     //       Lab 7 Step 7 之后可以加一个 GPU argmax kernel 作为练习项。
     // =========================================================================
+
+    // =========================================================================
+    // B.1 step 2: 中粒度计时 summary
+    // -------------------------------------------------------------------------
+    // 输出格式约束：
+    //   [PROFILE] 前缀方便 grep/awk 后处理
+    //   每行一条数据，不混 std::cout 的其他打印
+    //   所有时间单位毫秒（ms），保留 3 位小数
+    // =========================================================================
+    auto wallclock_end = std::chrono::steady_clock::now();
+    prof.total_wallclock_ms = std::chrono::duration<double, std::milli>(wallclock_end - wallclock_start).count();
+
+    std::cout << "\n[PROFILE] === B.1 step 2 baseline ===\n";
+    std::cout << "[PROFILE] total_wallclock_ms=" << prof.total_wallclock_ms << "\n";
+    std::cout << "[PROFILE] model_load_ms=" << prof.model_load_ms << "\n";
+
+    // Prefill：每次调用一行，并算总和与均值
+    double prefill_sum = 0.0;
+    for (size_t i = 0; i < prof.prefill_ms.size(); ++i)
+    {
+        std::cout << "[PROFILE] prefill[" << i << "] prompt_len=" << prof.prefill_prompt_len[i]
+                  << " gpu_ms=" << prof.prefill_ms[i] << "\n";
+        prefill_sum += prof.prefill_ms[i];
+    }
+    if (!prof.prefill_ms.empty())
+    {
+        std::cout << "[PROFILE] prefill_count=" << prof.prefill_ms.size()
+                  << " sum_ms=" << prefill_sum
+                  << " mean_ms=" << (prefill_sum / prof.prefill_ms.size()) << "\n";
+    }
+
+    // Decode：每轮一行（数量多时太冗，只打首末和聚合）
+    double decode_sum = 0.0;
+    double decode_min = 1e18, decode_max = 0.0;
+    for (double ms : prof.decode_step_ms)
+    {
+        decode_sum += ms;
+        if (ms < decode_min) decode_min = ms;
+        if (ms > decode_max) decode_max = ms;
+    }
+    if (!prof.decode_step_ms.empty())
+    {
+        // 只打前 5 步和后 5 步，避免长 prompt 时输出爆炸
+        size_t n = prof.decode_step_ms.size();
+        size_t head = n < 10 ? n : 5;
+        for (size_t i = 0; i < head; ++i)
+        {
+            std::cout << "[PROFILE] decode[" << i << "] active_slots=" << prof.decode_step_active_slots[i]
+                      << " gpu_ms=" << prof.decode_step_ms[i] << "\n";
+        }
+        if (n > 10)
+        {
+            std::cout << "[PROFILE] decode[...] (skipping " << (n - 10) << " middle steps)\n";
+            for (size_t i = n - 5; i < n; ++i)
+            {
+                std::cout << "[PROFILE] decode[" << i << "] active_slots=" << prof.decode_step_active_slots[i]
+                          << " gpu_ms=" << prof.decode_step_ms[i] << "\n";
+            }
+        }
+        std::cout << "[PROFILE] decode_step_count=" << n
+                  << " sum_ms=" << decode_sum
+                  << " mean_ms=" << (decode_sum / n)
+                  << " min_ms=" << decode_min
+                  << " max_ms=" << decode_max << "\n";
+    }
+
+    std::cout << "[PROFILE] argmax_cpu_total_ms=" << prof.total_argmax_cpu_ms << "\n";
+    std::cout << "[PROFILE] total_decode_tokens=" << prof.total_decode_tokens << "\n";
+    if (decode_sum > 0)
+    {
+        // tok/s = tokens / (decode_sum_seconds) — decode GPU throughput（不含 argmax CPU）
+        double decode_tok_per_s = prof.total_decode_tokens / (decode_sum / 1000.0);
+        std::cout << "[PROFILE] decode_gpu_tok_per_s=" << decode_tok_per_s << "\n";
+    }
+    if (prof.total_wallclock_ms > 0)
+    {
+        // tok/s = tokens / 总 wall-clock — 端到端 throughput（含 model load + prefill + cleanup）
+        double e2e_tok_per_s = prof.total_decode_tokens / (prof.total_wallclock_ms / 1000.0);
+        std::cout << "[PROFILE] e2e_tok_per_s=" << e2e_tok_per_s << "\n";
+    }
+    std::cout << "[PROFILE] === end ===\n";
 
     return 0;
 }
