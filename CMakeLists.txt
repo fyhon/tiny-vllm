@@ -1,6 +1,20 @@
 cmake_minimum_required(VERSION 3.24)
-set(CMAKE_CUDA_COMPILER "/opt/cuda/bin/nvcc")
-set(CUDACXX "/opt/cuda/bin/nvcc")
+
+# Auto-detect nvcc: prefer CMAKE_CUDA_COMPILER env override, then PATH lookup,
+# else fall back to common install locations. Original hardcoded "/opt/cuda" only
+# matched the original author's setup; cuda-lab containers ship CUDA at /usr/local/cuda.
+if(NOT DEFINED CMAKE_CUDA_COMPILER)
+    find_program(NVCC_EXECUTABLE nvcc
+        HINTS /usr/local/cuda/bin /opt/cuda/bin /usr/bin
+        DOC "nvcc compiler path")
+    if(NVCC_EXECUTABLE)
+        set(CMAKE_CUDA_COMPILER "${NVCC_EXECUTABLE}")
+    endif()
+endif()
+if(NOT DEFINED CUDACXX)
+    set(CUDACXX "${CMAKE_CUDA_COMPILER}")
+endif()
+
 project(tiny-vllm LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
